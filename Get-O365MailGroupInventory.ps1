@@ -866,7 +866,16 @@ try {
         Connect-MgGraph -Scopes $graphScopes.ToArray() -NoWelcome
     }
 } catch {
-    Write-Log "Microsoft Graph connection failed — security-groups, CA, and admin-posture sheets will be skipped: $($_.Exception.Message)" 'WARN'
+    $exMsg = $_.Exception.Message
+    Write-Log "Microsoft Graph connection failed — security-groups, CA, and admin-posture sheets will be skipped: $exMsg" 'WARN'
+    if ($exMsg -match 'AADSTS90099') {
+        Write-Log "AADSTS90099 = the customer tenant has no service principal for the OAuth client we're trying to use. There's no code-side fix." 'WARN'
+        Write-Log "FIX: a Cloud Application Administrator (or Global Administrator) in this customer tenant needs to consent the app once. Send the customer admin this URL:" 'WARN'
+        if ($multiTenantMode) {
+            Write-Log "  https://login.microsoftonline.com/$TenantId/adminconsent?client_id=14d82eec-204b-4c2f-b7e8-296a70dab67e" 'WARN'
+        }
+        Write-Log "Alternatively, extend GDAP role templates to include 'Cloud Application Administrator' so partner-side admins can consent on first use. After consent, future runs against this tenant will succeed." 'WARN'
+    }
     $graphConnected = $false
 }
 
@@ -879,7 +888,11 @@ try {
         Connect-MicrosoftTeams | Out-Null
     }
 } catch {
-    Write-Log "Microsoft Teams connection failed — Teams sheet will be skipped: $($_.Exception.Message)" 'WARN'
+    $exMsg = $_.Exception.Message
+    Write-Log "Microsoft Teams connection failed — Teams sheet will be skipped: $exMsg" 'WARN'
+    if ($exMsg -match 'AADSTS90099' -and $multiTenantMode) {
+        Write-Log "Teams Microsoft.Teams app SP is also missing in this customer tenant. Same fix path: customer admin consents at https://login.microsoftonline.com/$TenantId/adminconsent?client_id=12128f48-ec9e-42f0-b203-ea49fb6af367" 'WARN'
+    }
     $teamsConnected = $false
 }
 

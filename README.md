@@ -8,6 +8,7 @@ A PowerShell 7 toolkit that runs a Microsoft 365 posture inventory across every 
 - `Get-O365MailGroupInventory.ps1` — the single-tenant collection script. Connects to a customer tenant via Microsoft Graph + Exchange Online + Microsoft Teams and writes a 16-tab `.xlsx` of posture data (mailboxes, groups, Teams, Conditional Access, directory roles, admin users, break-glass candidates). Runs standalone against your own tenant or as a child process driven by the orchestrator.
 - `scripts/Register-PartnerCenterApp.ps1` — one-time partner-app registration with the right permissions and admin consent applied programmatically.
 - `scripts/Setup-LocalConfig.ps1` — interactive config setup. Run once per operator machine.
+- `scripts/Test-TenantPreflight.ps1` — pre-flight validation. Silently tests every GDAP customer tenant and prints a punchlist of the ones that need admin consent or are blocked by Conditional Access, with the consent URL inline.
 
 ## Status
 
@@ -102,6 +103,24 @@ $env:M365_MULTI_PFX_PASSWORD = '<your-pfx-password>'
 `-AppOnly` requires `certificateThumbprint` and `certificatePfxPath` populated in the local config. The PFX password is resolved from the env var named in `certificatePfxPasswordEnvVar` (default `M365_MULTI_PFX_PASSWORD`); if the env var is not set, falls back to an interactive prompt.
 
 **Caveat.** App-only auth against customer tenants requires the partner-app's service principal to be authorized in each customer tenant. With standard GDAP role grants (which assign Entra roles to user security groups, not to the partner-app SP), `-AppOnly` will fail at the per-customer connect step until you either (a) extend GDAP role templates to grant app-management to the partner-app SP, or (b) each customer's admin manually consents the partner-app SP. Plan delegated mode as the working path; treat `-AppOnly` as future capability.
+
+### Pre-flight validation
+
+Before a long multi-tenant run, you can validate that every GDAP customer tenant is reachable and properly consented. The pre-flight script does a single device-code sign-in to your partner tenant, then silently tests each customer tenant's `/token` endpoint and prints a punchlist of the tenants that need attention:
+
+```powershell
+./scripts/Test-TenantPreflight.ps1
+```
+
+Each problem tenant comes back with a category and a fix. The most common ones:
+
+- **`NEEDS_CONSENT (no SP)`** / **`NEEDS_CONSENT (scopes)`** — the customer tenant has no service principal for Microsoft Graph PowerShell, or the SP exists but the requested scopes aren't consented. Send the customer admin the printed `/adminconsent` URL — one click and they're done. (Heads-up: Microsoft drops them on a "This is not the right page" / phishing-warning page after they accept. That's the normal endpoint for first-party admin-consent flows; consent did land.)
+- **`BLOCKED_BY_CA (device-code only)`** — the customer's "Authentication Flows Policy" CA control blocks device code flow. Pre-flight uses device code flow so it can't validate them, but the actual wrapper uses interactive browser auth and may still work. Try a `-OnlyTenant` run against the tenant; only escalate to the customer admin if that also fails.
+- **`NO_ACCESS (GDAP)`** — your account isn't in the customer tenant. The GDAP relationship has lapsed.
+
+Re-test a single tenant after consent with `./scripts/Test-TenantPreflight.ps1 -OnlyTenant '<name-or-guid>'`.
+
+A clean pre-flight run prints a one-line success message and writes nothing to disk.
 
 ### Per-tenant confirmation prompt
 
