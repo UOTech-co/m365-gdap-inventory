@@ -6,20 +6,33 @@
 .DESCRIPTION
     Run this once on each operator machine before the first run of
     Get-O365MailGroupInventory-Multi.ps1. The script reads the schema-example
-    `tenants.config.json` (kept in version control with placeholders), prompts
-    you for the values that need to be filled in, validates each input, and
-    writes the populated result to `tenants.config.local.json` (gitignored
-    by default, lives outside the index).
+    `tenants.config.json` (kept in version control with placeholders),
+    prompts you for the values that need to be filled in, validates each
+    input, and writes the populated result to `tenants.config.local.json`
+    (gitignored by default, lives outside the index).
 
-    Idempotent. If `tenants.config.local.json` already exists, current values
-    are shown as defaults and you can press Enter to keep them — useful for
-    fixing one field without re-typing the rest.
+    By default, the script begins with an interactive sign-in to Microsoft
+    Graph that auto-discovers your home tenant id and the partner-app
+    clientId from your tenant's app registrations. The discovered values
+    pre-fill the prompts, so most operators just press Enter to confirm. If
+    auto-discovery fails (consent not granted, app not registered yet, or
+    multiple ambiguous candidates) the script falls back to manual entry
+    cleanly.
+
+    Idempotent. If `tenants.config.local.json` already exists, current
+    values are shown as defaults and you can press Enter to keep them —
+    useful for fixing one field without re-typing the rest. Existing config
+    values take precedence over auto-discovered ones.
 
     What it asks for:
 
       Always required (delegated mode is the default staff workflow):
-        - Partner-app clientId          (GUID, from Register-PartnerCenterApp.ps1 output)
-        - Home tenant id                (GUID, your partner tenant in Entra ID)
+        - Partner-app clientId          (GUID; auto-discovered from your
+                                         tenant's app registrations when
+                                         Application.Read.All is consented,
+                                         else prompt-only)
+        - Home tenant id                (GUID; auto-discovered from your
+                                         signed-in Microsoft Graph context)
 
       Required only with -AppOnly:
         - Certificate thumbprint        (40 hex characters, from registration output)
@@ -53,6 +66,13 @@
     Skip all prompts; require every value via parameter. Useful for
     automated provisioning. Pair with -ClientId, -HomeTenantId, etc.
 
+.PARAMETER NoAutoDiscover
+    Skip the interactive Microsoft Graph sign-in that auto-discovers
+    home tenant id + clientId. Use when you know your tenant doesn't
+    have Application.Read.All consented for the Microsoft Graph
+    PowerShell client and you'd rather not waste 5–10 seconds on the
+    failed attempt.
+
 .PARAMETER ClientId
     Partner-app client id (when -NonInteractive).
 
@@ -71,7 +91,13 @@
 
 .EXAMPLE
     ./scripts/Setup-LocalConfig.ps1
-    # Delegated-only setup. Two prompts: clientId + homeTenantId.
+    # Default: signs you in once, auto-discovers home tenant id and the
+    # partner-app clientId, prompts you to confirm each (press Enter to
+    # accept the auto-discovered values), writes tenants.config.local.json.
+
+.EXAMPLE
+    ./scripts/Setup-LocalConfig.ps1 -NoAutoDiscover
+    # Skip the auto-discovery sign-in. Two manual prompts only.
 
 .EXAMPLE
     ./scripts/Setup-LocalConfig.ps1 -AppOnly
@@ -101,6 +127,7 @@ param(
     [string] $ConfigDestination             = (Join-Path $PSScriptRoot '..' 'tenants.config.local.json'),
     [switch] $AppOnly,
     [switch] $NonInteractive,
+    [switch] $NoAutoDiscover,
     [string] $ClientId,
     [string] $HomeTenantId,
     [string] $CertificateThumbprint,
@@ -184,21 +211,121 @@ function Default-From {
 }
 
 # ============================================================================
+# Auto-discovery: sign in once, grab homeTenantId from the auth context, query
+# app registrations to suggest clientId. Best-effort — falls back to manual
+# prompts if the user lacks Application.Read.All consent or if the partner app
+# can't be found unambiguously.
+# ============================================================================
+
+function Try-AutoDiscover {
+    param([switch]$Skip)
+    $result = @{ TenantId = $null; ClientId = $null }
+    if ($Skip) { return $result }
+
+    Write-Host ''
+    Write-Host '=== Auto-discovery (sign-in to your tenant) ===' -ForegroundColor Cyan
+    Write-Host '    Sign in with your tenant account; the script will read your'
+    Write-Host '    tenant id and look for the partner-app registration.'
+    Write-Host '    Press Ctrl+C to skip and enter values manually.'
+    Write-Host ''
+
+    # Bootstrap modules. Microsoft.Graph.Authentication is enough for the
+    # tenant-id read; Microsoft.Graph.Applications is what gives us
+    # Get-MgApplication for the clientId discovery.
+    foreach ($mod in @('Microsoft.Graph.Authentication','Microsoft.Graph.Applications')) {
+        if (-not (Get-Module -ListAvailable -Name $mod)) {
+            Write-Step "Installing $mod (CurrentUser scope)..."
+            try {
+                Install-Module $mod -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            } catch {
+                Write-Warn "Could not install $mod automatically: $($_.Exception.Message)"
+                return $result
+            }
+        }
+        Import-Module $mod -ErrorAction SilentlyContinue
+    }
+
+    # Try sign-in. Application.Read.All is treated as optional — a
+    # tenant-wide admin-consent on the Microsoft Graph PowerShell client lets
+    # regular users hold this scope, but if it's not consented the call fails
+    # and we fall back gracefully.
+    try {
+        Connect-MgGraph -Scopes 'User.Read','Application.Read.All' -NoWelcome -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Warn "Sign-in failed or Application.Read.All not consented: $($_.Exception.Message)"
+        Write-Warn 'Falling back to manual entry.'
+        return $result
+    }
+
+    $ctx = Get-MgContext
+    if (-not $ctx) {
+        Write-Warn 'No Graph context after sign-in; falling back to manual entry.'
+        return $result
+    }
+
+    $result.TenantId = $ctx.TenantId
+    Write-Ok ("Detected home tenant: {0}  (signed in as {1})" -f $ctx.TenantId, $ctx.Account)
+
+    # Look for partner-app candidates: multi-tenant audience, has Microsoft
+    # Graph in requiredResourceAccess. Filter by name as a tie-breaker.
+    try {
+        $candidates = Get-MgApplication -All -ErrorAction Stop |
+            Where-Object {
+                $_.SignInAudience -eq 'AzureADMultipleOrgs' -and
+                @($_.RequiredResourceAccess.ResourceAppId) -contains '00000003-0000-0000-c000-000000000000'
+            }
+    } catch {
+        Write-Warn "Could not list app registrations: $($_.Exception.Message)"
+        Write-Warn '(This usually means Application.Read.All needs admin consent in your tenant.)'
+        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+        return $result
+    }
+
+    $candidates = @($candidates)
+    if ($candidates.Count -eq 0) {
+        Write-Warn "No multi-tenant Entra apps with Microsoft Graph permissions found in this tenant."
+        Write-Warn "Either the partner app hasn't been registered yet (run scripts/Register-PartnerCenterApp.ps1) or Application.Read.All didn't return enough scope. Falling back to manual entry."
+    } elseif ($candidates.Count -eq 1) {
+        $result.ClientId = $candidates[0].AppId
+        Write-Ok ("Auto-discovered partner app: {0}  (clientId {1})" -f $candidates[0].DisplayName, $candidates[0].AppId)
+    } else {
+        Write-Host "    Found $($candidates.Count) candidate apps. Pick one:"
+        for ($i = 0; $i -lt $candidates.Count; $i++) {
+            Write-Host ("      [{0}] {1}  (clientId {2})" -f $i, $candidates[$i].DisplayName, $candidates[$i].AppId)
+        }
+        $picked = Read-Host '    Enter number (or press Enter to skip and enter manually)'
+        if ($picked -match '^\d+$' -and [int]$picked -lt $candidates.Count) {
+            $result.ClientId = $candidates[[int]$picked].AppId
+            Write-Ok ("Selected: {0}  (clientId {1})" -f $candidates[[int]$picked].DisplayName, $candidates[[int]$picked].AppId)
+        }
+    }
+
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+    return $result
+}
+
+# ============================================================================
 # Collect values
 # ============================================================================
 
 if (-not $NonInteractive) {
+    $discovered = Try-AutoDiscover -Skip:$NoAutoDiscover
+
     Write-Host ''
     Write-Host '=== Partner-app values (always required) ===' -ForegroundColor Cyan
 
+    # Default precedence: existing config > auto-discovered > nothing
+    $clientIdDefault     = (Default-From $existing 'partner.clientId')     ; if (-not $clientIdDefault)     { $clientIdDefault     = $discovered.ClientId }
+    $homeTenantIdDefault = (Default-From $existing 'partner.homeTenantId') ; if (-not $homeTenantIdDefault) { $homeTenantIdDefault = $discovered.TenantId }
+
     $ClientId = Read-Required `
         -Prompt    'Partner-app clientId (GUID)' `
-        -Default   (Default-From $existing 'partner.clientId') `
+        -Default   $clientIdDefault `
         -Validator { param($v) Test-Guid $v }
 
     $HomeTenantId = Read-Required `
         -Prompt    'Home tenant id (GUID)' `
-        -Default   (Default-From $existing 'partner.homeTenantId') `
+        -Default   $homeTenantIdDefault `
         -Validator { param($v) Test-Guid $v }
 
     if ($AppOnly) {
