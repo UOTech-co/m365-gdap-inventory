@@ -318,9 +318,35 @@ if (-not $NonInteractive) {
     Write-Host ''
     Write-Host '=== Partner-app values (always required) ===' -ForegroundColor Cyan
 
-    # Default precedence: existing config > auto-discovered > nothing
-    $clientIdDefault     = (Default-From $existing 'partner.clientId')     ; if (-not $clientIdDefault)     { $clientIdDefault     = $discovered.ClientId }
-    $homeTenantIdDefault = (Default-From $existing 'partner.homeTenantId') ; if (-not $homeTenantIdDefault) { $homeTenantIdDefault = $discovered.TenantId }
+    # Default precedence: auto-discovered (live truth from current tenant) > existing config > nothing.
+    # Existing-config-first was wrong: when an app gets re-registered, the
+    # stale config wins and the prompt offers a clientId that no longer
+    # exists in the tenant, leading to AADSTS700016 on the next sign-in.
+    # Auto-discovery is the live state of the tenant and should win when
+    # present; warn the operator if existing config disagrees so they know
+    # something changed.
+    $existingClientId   = (Default-From $existing 'partner.clientId')
+    $existingTenantId   = (Default-From $existing 'partner.homeTenantId')
+
+    if ($discovered.ClientId) {
+        $clientIdDefault = $discovered.ClientId
+        if ($existingClientId -and $existingClientId -ne $discovered.ClientId) {
+            Write-Warn "existing config clientId ($existingClientId) differs from the live auto-discovered value."
+            Write-Warn "  Using auto-discovered ($($discovered.ClientId)) as the prompt default. Press Enter to accept; type the existing value to override."
+        }
+    } else {
+        $clientIdDefault = $existingClientId
+    }
+
+    if ($discovered.TenantId) {
+        $homeTenantIdDefault = $discovered.TenantId
+        if ($existingTenantId -and $existingTenantId -ne $discovered.TenantId) {
+            Write-Warn "existing config homeTenantId ($existingTenantId) differs from the live auto-discovered value."
+            Write-Warn "  Using auto-discovered ($($discovered.TenantId)) as the prompt default. Press Enter to accept; type the existing value to override."
+        }
+    } else {
+        $homeTenantIdDefault = $existingTenantId
+    }
 
     $ClientId = Read-Required `
         -Prompt    'Partner-app clientId (GUID)' `
