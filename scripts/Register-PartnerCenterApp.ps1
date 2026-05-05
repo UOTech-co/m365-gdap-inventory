@@ -46,15 +46,17 @@
          accordingly.
       4. Look up the app by displayName.
          - If app exists AND this cert is already attached:
-             verify, print values, exit (idempotent re-run).
+             verify, patch missing pieces (signInAudience, missing perms,
+             missing http://localhost redirect URI), print values, exit.
          - If app exists AND this cert is NOT attached:
              show currently-attached certs, prompt for confirmation, then
              APPEND this cert to the app's KeyCredentials (multi-machine
              pattern B).
          - If app does not exist:
-             create it with the right requiredResourceAccess block, attach
-             the cert as the first key credential, create the service
-             principal.
+             create it with the right requiredResourceAccess block,
+             publicClient.redirectUris = http://localhost (required for
+             delegated interactive sign-in), attach the cert as the first
+             key credential, create the service principal.
       5. Grant admin consent programmatically by creating an
          appRoleAssignment for each requested permission against the
          relevant resource service principal (Microsoft Graph, Office 365
@@ -437,6 +439,19 @@ if ($existing) {
     Update-MgApplication -ApplicationId $existing.Id -RequiredResourceAccess $resourceAccessList
     Write-Ok 'requiredResourceAccess set.'
 
+    # Patch publicClient.redirectUris. Required for delegated interactive
+    # sign-in via Connect-MgGraph -ClientId <partner-app>: MSAL spins up a
+    # local loopback server to receive the OAuth callback, and Entra refuses
+    # to redirect back to a URI that's not registered on the app
+    # (AADSTS500113: No reply address is registered for the application).
+    $existingRedirects = @($existing.PublicClient.RedirectUris)
+    if ($existingRedirects -notcontains 'http://localhost') {
+        Write-Step 'Adding http://localhost to publicClient.redirectUris...'
+        $combined = @($existingRedirects + 'http://localhost' | Where-Object { $_ } | Select-Object -Unique)
+        Update-MgApplication -ApplicationId $existing.Id -PublicClient @{ RedirectUris = $combined }
+        Write-Ok 'publicClient.redirectUris updated.'
+    }
+
     # Refresh the app object to pick up the updates above.
     $existing = Get-MgApplication -ApplicationId $existing.Id
 
@@ -505,10 +520,14 @@ else {
     Write-Step 'App does not exist; creating it...'
     # Multi-tenant audience: required so customer tenants will mint tokens for
     # this clientId when staff sign in via GDAP-mediated delegated flows.
+    # publicClient.redirectUris: required for delegated interactive sign-in
+    # via Connect-MgGraph -ClientId <partner-app>; MSAL spins up a local
+    # loopback callback. Without this, sign-in fails with AADSTS500113.
     $app = New-MgApplication `
         -DisplayName            $AppDisplayName `
         -SignInAudience         'AzureADMultipleOrgs' `
-        -RequiredResourceAccess $resourceAccessList
+        -RequiredResourceAccess $resourceAccessList `
+        -PublicClient           @{ RedirectUris = @('http://localhost') }
     Write-Ok ("AppId (ClientId): {0}" -f $app.AppId)
     Write-Ok ("ObjectId:         {0}" -f $app.Id)
 
