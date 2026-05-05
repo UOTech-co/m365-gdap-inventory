@@ -802,15 +802,26 @@ $multiTenantMode = [bool]$TenantId
 
 try {
     Write-Log "Connecting to Exchange Online..."
+    # The cmdlet set this script needs. Passed as -CommandName so EXO V3
+    # explicitly imports them rather than relying on the autoload heuristic
+    # (which sometimes fails under -DelegatedOrganization on PS7 — Get-
+    # UnifiedGroup in particular has been observed missing without this).
+    $exoCmds = @(
+        'Get-Mailbox','Get-EXOMailbox','Get-MailboxStatistics','Get-EXOMailboxStatistics',
+        'Get-MailboxFolderStatistics','Get-MailboxPermission','Get-EXOMailboxPermission',
+        'Get-RecipientPermission','Get-EXORecipientPermission','Get-CalendarProcessing',
+        'Get-Place','Get-DistributionGroup','Get-DistributionGroupMember',
+        'Get-UnifiedGroup','Get-UnifiedGroupLinks','Get-Recipient','Get-EXORecipient'
+    )
     if ($multiTenantMode -and $DelegatedOrganization) {
         # Delegated GDAP EXO connect — first-party EXO PowerShell auth, the
         # running user's GDAP rights authorize the recipient + organization
         # reads in the customer tenant.
-        Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -ShowBanner:$false
+        Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false
     } elseif ($UserPrincipalName) {
-        Connect-ExchangeOnline -UserPrincipalName $UserPrincipalName -ShowBanner:$false
+        Connect-ExchangeOnline -UserPrincipalName $UserPrincipalName -CommandName $exoCmds -ShowBanner:$false
     } else {
-        Connect-ExchangeOnline -ShowBanner:$false
+        Connect-ExchangeOnline -CommandName $exoCmds -ShowBanner:$false
     }
 } catch { Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'; throw }
 
@@ -1091,7 +1102,21 @@ Initialize-SharePointUsageCache
 
 # ------------------------------------------------------------------ M365 groups
 Write-Log "Collecting Microsoft 365 (Unified) Groups..."
-$ugs = Get-UnifiedGroup -ResultSize Unlimited
+
+# Defensive: Get-UnifiedGroup is an EXO implicit-remoting cmdlet. On EXO V3
+# with -DelegatedOrganization (GDAP delegated session) on PowerShell 7, this
+# cmdlet sometimes fails to auto-import even though Connect-ExchangeOnline
+# succeeded. Without this guard, the not-recognized error crashes the entire
+# tenant run before the workbook export step. Skip the M365 Groups + Teams
+# sections cleanly if Get-UnifiedGroup isn't loaded; downstream code that
+# depends on $ugs already handles empty/null arrays.
+$ugs = $null
+if (Get-Command Get-UnifiedGroup -ErrorAction SilentlyContinue) {
+    $ugs = Try-Block { Get-UnifiedGroup -ResultSize Unlimited } "Get-UnifiedGroup -ResultSize Unlimited"
+} else {
+    Write-Log "Get-UnifiedGroup not available in this EXO session — M365 Groups + Teams sheets will be empty. (EXO V3 + -DelegatedOrganization sometimes fails to import implicit-remoting cmdlets; this is a known EXO PowerShell limitation, not a permission issue.)" 'WARN'
+}
+if (-not $ugs) { $ugs = @() }
 
 # Cache SP stats per group GUID so the Teams pass reuses the same lookup.
 $spStatsByGroupId = @{}
