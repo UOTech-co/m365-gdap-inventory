@@ -12,10 +12,10 @@
 .DESCRIPTION
     Single-tenant Microsoft 365 posture inventory. Connects via interactive
     modern auth (browser popup, MFA-aware) by default, or against a specific
-    customer tenant when -TenantId and -ClientId are supplied (for delegated
-    multi-tenant flows driven by Get-O365MailGroupInventory-Multi.ps1). Pulls
-    structural + usage metadata from Exchange Online, Microsoft Graph, and
-    Microsoft Teams.
+    customer tenant when -TenantId is supplied (for delegated multi-tenant
+    flows driven by Get-O365MailGroupInventory-Multi.ps1). Pulls structural
+    + usage metadata from Exchange Online, Microsoft Graph, and Microsoft
+    Teams.
 
     Workbook tabs produced (in workbook order):
       - Summary             : object counts + run metadata
@@ -793,10 +793,12 @@ Ensure-Module -Name 'ImportExcel'                     -MinVersion '7.0.0'
 # Two auth modes:
 #   - Standalone (default): home-tenant interactive sign-in. Used when running
 #     this script directly against your own tenant.
-#   - Multi-tenant delegated: -TenantId + -ClientId set, optional
-#     -DelegatedOrganization for EXO. Used when the wrapper drives this script
-#     against customer tenants via GDAP/Lighthouse.
-$multiTenantMode = $TenantId -and $ClientId
+#   - Multi-tenant delegated: -TenantId set, optional -DelegatedOrganization for EXO.
+#     Used when the wrapper drives this script against customer tenants via
+#     GDAP/Lighthouse. -ClientId is accepted for future app-only flows but
+#     intentionally NOT used for delegated Connect-MgGraph (AADSTS90099 prevention
+#     — see comment in the connect block below).
+$multiTenantMode = [bool]$TenantId
 
 try {
     Write-Log "Connecting to Exchange Online..."
@@ -836,9 +838,19 @@ try {
         ))
     }
     if ($multiTenantMode) {
-        # Delegated multi-tenant: token issued for $TenantId under the
-        # partner-app clientId. GDAP/Lighthouse propagates the user's role.
-        Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -Scopes $graphScopes.ToArray() -NoWelcome
+        # Delegated multi-tenant: token issued for $TenantId. We deliberately
+        # do NOT pass -ClientId — that would route through the caller's custom
+        # partner-app clientId, which most customer tenants haven't authorized
+        # (AADSTS90099: "The application has not been authorized in the tenant").
+        # Standard GDAP role templates don't include Cloud Application
+        # Administrator, so partner-side users can't admin-consent custom apps
+        # in customer tenants on first use. Letting Connect-MgGraph fall back
+        # to the default Microsoft Graph PowerShell client (pre-authorized in
+        # essentially every tenant) sidesteps that. GDAP/Lighthouse roles
+        # still propagate via the running user's identity, not the app.
+        # The $ClientId param remains accepted on this script for future
+        # app-only flows where a custom client is required.
+        Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome
     } else {
         Connect-MgGraph -Scopes $graphScopes.ToArray() -NoWelcome
     }
