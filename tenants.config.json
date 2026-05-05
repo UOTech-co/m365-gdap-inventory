@@ -1,0 +1,99 @@
+{
+  "$schema": "./tenants.config.schema.json",
+  "_comment": "Schema example for Get-O365MailGroupInventory-Multi.ps1. Copy to tenants.config.local.json (gitignored) and populate with real values via scripts/Setup-LocalConfig.ps1. Default behaviour is to enumerate every GDAP customer; entries in the tenants array either (a) supply auth for a tenant that has no GDAP relationship, or (b) override the auth mode for one that does.",
+
+  "_v1Note": "v1 — the single-tenant inventory script this wrapper drives — is NOT bundled with this repo. Install it separately and point v1ScriptPath at the .ps1 entry point. v1 must be a PowerShell 7+ script that accepts -OutputPath and produces a 16-tab .xlsx of M365 posture data; the wrapper either dot-sources it (library mode) or spawns a child process per tenant, depending on the wiring path you pick (see README).",
+  "v1ScriptPath": "<path to your single-tenant inventory script>",
+
+  "partner": {
+    "_comment": "Partner-center app registration in your home tenant. homeTenantId + clientId are ALWAYS required (used by both delegated and app-only auth modes). The cert fields below are required ONLY when running the wrapper with -AppOnly (cert-based unattended runs). Staff running in default delegated mode don't need a cert and can leave the cert fields null.",
+    "homeTenantId":                  "<HOME-TENANT-ID-GUID>",
+    "clientId":                      "<PARTNER-APP-CLIENT-ID-GUID>",
+
+    "_certComment":                  "Cert fields — required only with -AppOnly. Leave null on staff machines.",
+    "certificateThumbprint":         null,
+    "certificatePfxPath":            null,
+    "certificatePfxPasswordEnvVar":  "M365_MULTI_PFX_PASSWORD",
+    "_pfxPasswordNote":              "When -AppOnly is set, the wrapper resolves the PFX password from the env var named here (so the password never lives in any file). Set it per shell session: $env:M365_MULTI_PFX_PASSWORD = 'your-password'  (PowerShell). Falls back to an interactive prompt if the env var is not set.",
+
+    "_setupNote": "Run scripts/Setup-LocalConfig.ps1 to populate the real-config copy at tenants.config.local.json (gitignored). Use -AppOnly to also collect cert fields for unattended/scheduled runs."
+  },
+
+  "defaults": {
+    "_comment": "Applied per-tenant unless overridden in the tenant block.",
+    "skipMailboxStats":      false,
+    "skipPermissions":       false,
+    "skipUserMailboxes":     false,
+    "skipSharePointStats":   false,
+    "skipConditionalAccess": false,
+    "skipAdminPosture":      false,
+    "breakGlassNamePattern": "(?i)(break.?glass|emerg(ency)?|^bg-|-bg$|glass-)",
+    "inactiveAdminDays":     60
+  },
+
+  "exclude": [
+    {
+      "_comment": "Tenant IDs to skip even if a GDAP relationship exists. Useful for sandbox / decommissioned customer tenants that still appear in delegatedAdminCustomers.",
+      "tenantId": "<TENANT-GUID-TO-SKIP>",
+      "reason":   "Sandbox tenant — not in scope"
+    }
+  ],
+
+  "tenants": [
+    {
+      "_comment": "Example 1 — GDAP-implicit. Most managed customers fit here. Auth uses the partner app + delegated tokens; nothing else needs to be supplied. The block exists only to override shortName, skip flags, or notes; if you don't need overrides, omit it entirely and let the GDAP enumerator pick the tenant up by default.",
+      "displayName":   "Example Managed Client A",
+      "shortName":     "ECA",
+      "tenantId":      "<CUSTOMER-A-TENANT-GUID>",
+      "primaryDomain": "examplea.onmicrosoft.com",
+      "auth": {
+        "mode": "gdap"
+      },
+      "overrides": {
+        "skipUserMailboxes": false
+      }
+    },
+
+    {
+      "_comment": "Example 2 — stored-creds-explicit. Tenant has no GDAP relationship and uses local admin instead. Credentials live in PowerShell SecretManagement; the script resolves them at run time and never reads the secret value into a log. NOTE: as of 2026-05-05 no UOTech customer uses this mode (every customer is on or moving onto GDAP). Kept here purely as a schema example for future contingency.",
+      "displayName":   "Example Stored-Cred Tenant",
+      "shortName":     "XSC",
+      "tenantId":      "<EXAMPLE-STORED-CRED-TENANT-GUID>",
+      "primaryDomain": "examplestoredcred.onmicrosoft.com",
+      "auth": {
+        "mode":                "stored-credential",
+        "userPrincipalName":   "admin@examplestoredcred.onmicrosoft.com",
+        "secretManagement": {
+          "vaultName":  "UOTech-Inventory",
+          "secretName": "M365-XSC-Admin-Password"
+        },
+        "_caveat": "Password-based auth requires a CA exemption (named-location or device filter) and an MFA bypass for this admin account, OR an in-tenant app registration with cert-based auth — see auth.mode=app-only-cert below for the cleaner alternative."
+      }
+    },
+
+    {
+      "_comment": "Example 3 — app-only-cert. Tenant has its own admin app reg with cert-based credential. No GDAP relationship needed; the script connects directly with the in-tenant app. Cleanest non-GDAP option when the customer admin will install a cert.",
+      "displayName":   "Example Cert-Auth Tenant",
+      "shortName":     "XCT",
+      "tenantId":      "<EXAMPLE-CERT-TENANT-GUID>",
+      "primaryDomain": "examplecert.onmicrosoft.com",
+      "auth": {
+        "mode":                  "app-only-cert",
+        "clientId":              "<IN-TENANT-APP-CLIENT-ID>",
+        "certificateThumbprint": "<IN-TENANT-APP-CERT-THUMBPRINT>"
+      }
+    },
+
+    {
+      "_comment": "Example 4 — interactive. Last resort: human at the keyboard, browser popup, MFA-aware. Useful for one-off runs against a tenant where neither GDAP nor a service account is available. The script will pause for the auth flow, then continue.",
+      "displayName":   "Example Interactive Tenant",
+      "shortName":     "XIT",
+      "tenantId":      "<EXAMPLE-INTERACTIVE-TENANT-GUID>",
+      "primaryDomain": "exampleinteractive.onmicrosoft.com",
+      "auth": {
+        "mode":              "interactive",
+        "userPrincipalName": "admin@exampleinteractive.onmicrosoft.com"
+      }
+    }
+  ]
+}
