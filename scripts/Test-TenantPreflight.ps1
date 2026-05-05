@@ -96,7 +96,13 @@ $partnerTenantId = $config.partner.homeTenantId
 # against each customer tenant's /token endpoint.
 # ============================================================================
 
-$scopes = 'offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/DelegatedAdminRelationship.Read.All'
+# Request a representative admin-consent scope (Directory.Read.All) at sign-in
+# time so we can use it as the per-customer probe. Earlier versions tested
+# only User.Read, which can pass for a tenant where the SP exists but admin
+# scopes haven't been consented — exactly the case the wrapper actually
+# fails on (AADSTS90099). Directory.Read.All is requested by every v1 run,
+# so if we can acquire it for a customer tenant, the wrapper will too.
+$scopes = 'offline_access https://graph.microsoft.com/Directory.Read.All https://graph.microsoft.com/DelegatedAdminRelationship.Read.All'
 
 Write-Host '==> Initiating device-code sign-in...' -ForegroundColor Cyan
 
@@ -207,9 +213,10 @@ foreach ($c in $customers) {
                 grant_type    = 'refresh_token'
                 client_id     = $GraphPsClientId
                 refresh_token = $refreshToken
-                scope         = 'https://graph.microsoft.com/User.Read'
+                scope         = 'https://graph.microsoft.com/Directory.Read.All'
             }
-        # Success — the customer tenant has an SP for the Graph PS client.
+        # Success — the customer tenant has the SP and an admin-consent scope
+        # representative of v1's actual scope set is consented.
     }
     catch {
         $err = $null
@@ -279,8 +286,9 @@ Write-Host ''
 
 if (@($punchlist).Count -eq 0) {
     Write-Host ''
-    Write-Host ('OK — all {0} customer tenant(s) validated. The Microsoft Graph PowerShell client is authorized in every tenant.' -f $total) -ForegroundColor Green
-    Write-Host '   Note: this script doesn''t separately verify the Microsoft Teams PowerShell client. If Teams data is empty for any tenant after a real run, that tenant''s admin needs to consent the Teams client too.' -ForegroundColor DarkGray
+    Write-Host ('OK — all {0} customer tenant(s) passed the Directory.Read.All refresh-token probe.' -f $total) -ForegroundColor Green
+    Write-Host '   Caveat: preflight uses a refresh-token grant; the wrapper uses interactive browser auth. They mostly agree, but a tenant can pass preflight and still fail the wrapper if the customer''s tenant requires admin consent on first interactive use of the elevated scope set. If that happens, the v1 collector logs the consent URL inline — same fix as a NEEDS_CONSENT punchlist entry.' -ForegroundColor DarkGray
+    Write-Host '   Preflight also doesn''t separately verify the Microsoft Teams PowerShell client. Teams data flows through Graph for our inventory, so this rarely matters; if Teams data is empty for a tenant after a real run, send the customer admin the Teams consent URL too.' -ForegroundColor DarkGray
     return
 }
 
