@@ -40,6 +40,19 @@
 .PARAMETER SkipRollup
     If set, per-tenant workbooks are produced but the roll-up is not built.
 
+.PARAMETER NoConfirm
+    Skip the per-tenant Y/n/q confirmation prompt. Default is to prompt
+    before each tenant with a 30-second auto-Y countdown so the operator
+    can skip stale GDAP relationships from offboarded customers at runtime.
+    Use -NoConfirm for unattended runs (cron / launchd / Task Scheduler).
+    The prompt is also auto-skipped when -OnlyTenant targets a single
+    tenant, and when stdin is redirected.
+
+.PARAMETER ConfirmTimeoutSec
+    Per-tenant prompt timeout in seconds. Auto-Y when the countdown
+    elapses. Set to 0 to skip the wait entirely (effectively the same as
+    -NoConfirm). Default 30.
+
 .NOTES
     License: Apache-2.0 (see LICENSE in repo root)
     Created: 2026-05-05
@@ -63,7 +76,18 @@ param(
     # Path to the single-tenant inventory script invoked per customer. Default
     # is the bundled Get-O365MailGroupInventory.ps1 next to this script. Can be
     # overridden via param OR config.v1ScriptPath.
-    [string] $V1ScriptPath = (Join-Path $PSScriptRoot 'Get-O365MailGroupInventory.ps1')
+    [string] $V1ScriptPath = (Join-Path $PSScriptRoot 'Get-O365MailGroupInventory.ps1'),
+
+    # Skip the per-tenant Y/n/q confirmation prompt. Use for unattended runs
+    # (cron / launchd / Task Scheduler) where there's no human at the keyboard.
+    # Default behaviour prompts before each tenant with a 30-second auto-Y
+    # countdown so stale GDAP relationships from offboarded customers can be
+    # skipped at runtime.
+    [switch] $NoConfirm,
+
+    # Per-tenant prompt timeout in seconds. Auto-Y when the countdown elapses.
+    # Set to 0 to skip the wait entirely (effectively the same as -NoConfirm).
+    [int] $ConfirmTimeoutSec = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +108,46 @@ function Write-MultiLog {
     if     ($Level -eq 'ERROR') { Write-Host $line -ForegroundColor Red }
     elseif ($Level -eq 'WARN')  { Write-Host $line -ForegroundColor Yellow }
     else                        { Write-Host $line }
+}
+
+# Per-tenant confirmation with a countdown that auto-Y's at timeout.
+# Returns 'Y' (process), 'N' (skip), or 'Q' (stop the run after this point).
+# Auto-returns 'Y' when stdin is redirected (non-interactive context like
+# launchd/Task Scheduler), when the timeout is 0, or when the countdown elapses.
+function Read-TenantConfirmation {
+    param(
+        [Parameter(Mandatory)] [string] $DisplayName,
+        [string] $Domain,
+        [int]    $TimeoutSec = 30
+    )
+
+    if ($TimeoutSec -le 0) { return 'Y' }
+    if ([Console]::IsInputRedirected) { return 'Y' }
+
+    # Drain any keystrokes left over from a prior prompt
+    while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+
+    $label = if ($Domain) { "'$DisplayName' ($Domain)" } else { "'$DisplayName'" }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $ansiClearLine = [char]27 + '[K'
+
+    while ((Get-Date) -lt $deadline) {
+        $remaining = [Math]::Max(0, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+        $line = "Process {0}? [Y/n/q]  (auto-Y in {1,2}s)..." -f $label, $remaining
+        Write-Host -NoNewline ("`r{0}{1}" -f $line, $ansiClearLine)
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            Write-Host ''   # advance past the in-place line
+            if ($key.Key -eq [ConsoleKey]::Enter) { return 'Y' }
+            $char = $key.KeyChar.ToString().ToUpperInvariant()
+            if ($char -in 'Y','N','Q') { return $char }
+            return 'Y'   # any other key = accept default
+        }
+        Start-Sleep -Milliseconds 200
+    }
+
+    Write-Host ''   # advance past the in-place line
+    return 'Y'   # timeout = auto-Y
 }
 
 # ============================================================================
@@ -309,9 +373,41 @@ Write-MultiLog ("Tenant target count: {0}" -f @($tenantTargets).Count)
 
 if (-not (Test-Path $OutputRoot)) { New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null }
 
+$userQuit = $false
 foreach ($tenant in $tenantTargets) {
     $tStart = Get-Date
     Write-MultiLog ("─── {0} ({1}) — {2} ───" -f $tenant.DisplayName, $tenant.ShortName, $tenant.TenantId)
+
+    # Per-tenant Y/n/q confirmation. Skip when -NoConfirm, when -OnlyTenant
+    # is targeting a single tenant (no ambiguity to resolve), or when stdin
+    # is redirected (the helper auto-Y's in that case).
+    if (-not $NoConfirm -and -not $OnlyTenant) {
+        $answer = Read-TenantConfirmation `
+            -DisplayName $tenant.DisplayName `
+            -Domain      $tenant.PrimaryDomain `
+            -TimeoutSec  $ConfirmTimeoutSec
+        if ($answer -eq 'N') {
+            Write-MultiLog ("Skipped {0} by user choice." -f $tenant.DisplayName) 'WARN'
+            $script:RunResults.Add([pscustomobject]@{
+                TenantId      = $tenant.TenantId
+                DisplayName   = $tenant.DisplayName
+                ShortName     = $tenant.ShortName
+                PrimaryDomain = $tenant.PrimaryDomain
+                Source        = $tenant.Source
+                AuthMode      = $tenant.Auth.mode
+                Status        = 'skipped'
+                DurationSec   = 0
+                OutputPath    = $null
+                WarningCount  = 0
+            })
+            continue
+        }
+        if ($answer -eq 'Q') {
+            Write-MultiLog 'User chose to quit. Stopping the per-tenant loop; rollup will reflect tenants processed up to this point.' 'WARN'
+            $userQuit = $true
+            break
+        }
+    }
 
     $tenantOutDir = Join-Path $OutputRoot $tenant.ShortName
     if (-not (Test-Path $tenantOutDir)) { New-Item -ItemType Directory -Path $tenantOutDir -Force | Out-Null }
@@ -468,8 +564,10 @@ if (-not $SkipRollup) {
 $elapsed = (Get-Date) - $script:RunStarted
 $ok      = @($script:RunResults | Where-Object Status -eq 'ok').Count
 $err     = @($script:RunResults | Where-Object Status -eq 'error').Count
-Write-MultiLog ("Done. Tenants attempted: {0}; ok: {1}; error: {2}; elapsed: {3:hh\:mm\:ss}" -f
-    @($script:RunResults).Count, $ok, $err, $elapsed)
+$skipped = @($script:RunResults | Where-Object Status -eq 'skipped').Count
+$quitNote = if ($userQuit) { ' (run stopped early by user)' } else { '' }
+Write-MultiLog ("Done. Tenants in summary: {0}; ok: {1}; error: {2}; skipped: {3}; elapsed: {4:hh\:mm\:ss}{5}" -f
+    @($script:RunResults).Count, $ok, $err, $skipped, $elapsed, $quitNote)
 
 # Per-run summary CSV alongside the rollup, useful for diffing runs.
 $summaryCsv = Join-Path $OutputRoot ("run-summary_{0}.csv" -f $script:RunStamp)

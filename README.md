@@ -103,6 +103,18 @@ $env:M365_MULTI_PFX_PASSWORD = '<your-pfx-password>'
 
 **Caveat.** App-only auth against customer tenants requires the partner-app's service principal to be authorized in each customer tenant. With standard GDAP role grants (which assign Entra roles to user security groups, not to the partner-app SP), `-AppOnly` will fail at the per-customer connect step until you either (a) extend GDAP role templates to grant app-management to the partner-app SP, or (b) each customer's admin manually consents the partner-app SP. Plan delegated mode as the working path; treat `-AppOnly` as future capability.
 
+### Per-tenant confirmation prompt
+
+By default, the wrapper prompts before each customer tenant with a 30-second auto-Y countdown:
+
+```
+Process 'Acme Corp' (acme.onmicrosoft.com)? [Y/n/q]  (auto-Y in 27s)...
+```
+
+The `delegatedAdminCustomers` API includes customer-of-record relationships from offboarded customers; this prompt lets you skip stale ones at runtime instead of polluting the rollup. Press `Y` or Enter to process, `N` to skip (the tenant lands in the run summary with `Status='skipped'`), or `Q` to stop the run entirely (the rollup still gets built from tenants processed up to that point). Any other key accepts the default. Wait 30 seconds and the prompt auto-Y's.
+
+For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-OnlyTenant` targets a single tenant and when stdin is redirected.
+
 ### Other useful flags
 
 | Flag | Effect |
@@ -110,6 +122,8 @@ $env:M365_MULTI_PFX_PASSWORD = '<your-pfx-password>'
 | `-OnlyTenant <name-or-guid>` | Run a single tenant. Matches case-insensitively against `tenantId`, `shortName`, or `displayName`. Useful for retrying a failed tenant. |
 | `-SkipGdapEnumeration` | Skip the partner-tenant enumeration; use only tenants explicitly listed in your config. Useful for testing or fallback. |
 | `-SkipRollup` | Produce per-tenant workbooks but skip the rollup. |
+| `-NoConfirm` | Skip the per-tenant Y/n/q prompt entirely. Required for unattended runs. |
+| `-ConfirmTimeoutSec <n>` | Per-tenant prompt timeout. Default 30. Set to 0 for no wait (same effect as `-NoConfirm`). |
 | `-OutputRoot <path>` | Override where workbooks land. Default: `./output/`. |
 
 ## Configuration
