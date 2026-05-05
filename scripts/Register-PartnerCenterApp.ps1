@@ -175,8 +175,9 @@
     Created: 2026-05-05
 
     Required PowerShell modules (auto-installed if missing):
-      Microsoft.Graph.Authentication 2.0+
-      Microsoft.Graph.Applications   2.0+
+      Microsoft.Graph.Authentication      2.0+
+      Microsoft.Graph.Applications        2.0+
+      Microsoft.Graph.Identity.SignIns    2.0+   (oauth2PermissionGrant cmdlets)
 #>
 
 #Requires -Version 7.0
@@ -260,7 +261,7 @@ function Write-Warn { param([string]$Msg) Write-Host "    $Msg" -ForegroundColor
 # ============================================================================
 
 Write-Step 'Bootstrapping modules...'
-foreach ($mod in @('Microsoft.Graph.Authentication','Microsoft.Graph.Applications')) {
+foreach ($mod in @('Microsoft.Graph.Authentication','Microsoft.Graph.Applications','Microsoft.Graph.Identity.SignIns')) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
         Write-Warn "Installing $mod (CurrentUser scope)..."
         Install-Module $mod -Scope CurrentUser -Force -AllowClobber
