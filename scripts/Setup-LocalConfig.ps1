@@ -312,6 +312,10 @@ if (-not $NonInteractive) {
     $discovered = Try-AutoDiscover -Skip:$NoAutoDiscover
 
     Write-Host ''
+    Write-Host '    Tip: square-bracket values shown next to each prompt are defaults' -ForegroundColor DarkGray
+    Write-Host '         (auto-discovered or from your existing config). Press Enter to' -ForegroundColor DarkGray
+    Write-Host '         accept, or type a different value to override.' -ForegroundColor DarkGray
+    Write-Host ''
     Write-Host '=== Partner-app values (always required) ===' -ForegroundColor Cyan
 
     # Default precedence: existing config > auto-discovered > nothing

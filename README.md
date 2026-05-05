@@ -55,28 +55,28 @@ The script is idempotent and re-entrant. Re-running it patches an existing app r
 
 ### Set up per-machine configuration
 
-Each operator runs `scripts/Setup-LocalConfig.ps1` once. It prompts for `clientId` and `homeTenantId` (always required), validates the GUIDs, and writes `tenants.config.local.json`. Pass `-AppOnly` to also collect the cert thumbprint, PFX path, and PFX-password env-var name needed for unattended runs.
+Each operator runs `scripts/Setup-LocalConfig.ps1` once. The script auto-discovers as much as it can before prompting, so most operators just press Enter through the prompts.
 
 ```powershell
 # Default (delegated mode; what most operators need)
 ./scripts/Setup-LocalConfig.ps1
 
-# With cert handling for -AppOnly use
+# With cert handling for -AppOnly use (extra prompts: cert thumbprint, PFX path, env var name)
 ./scripts/Setup-LocalConfig.ps1 -AppOnly
 
-# Non-default config destination (kept entirely outside the repo)
-./scripts/Setup-LocalConfig.ps1 -ConfigDestination "$HOME/your-org/m365-multi/tenants.config.local.json"
+# Skip the auto-discovery sign-in (faster if you know your tenant won't allow it)
+./scripts/Setup-LocalConfig.ps1 -NoAutoDiscover
 ```
 
-Existing values are shown as defaults on re-run, so fixing one field doesn't require re-typing the rest. Placeholder-looking values (`<PARTNER-APP-CLIENT-ID-GUID>`, etc.) are rejected.
+What happens when you run it:
 
-### Wire up your single-tenant inventory script
+1. **Auto-discovery sign-in.** A browser opens to `login.microsoftonline.com`. Sign in with your tenant account; the script reads your home tenant id from the resulting Microsoft Graph context and queries app registrations to find the partner app.
+2. **Prompts with auto-filled defaults.** Each prompt shows the auto-discovered (or existing-config) value in square brackets, e.g. `Partner-app clientId (GUID) [00000000-...]:`. **Press Enter to accept the bracketed value, or type a different value to override.** Same convention for every subsequent prompt.
+3. **Config written.** `tenants.config.local.json` lands at the repo root (gitignored). The cert fields are populated only if you ran with `-AppOnly`.
 
-Edit `tenants.config.local.json` and set `v1ScriptPath` to the path of your single-tenant inventory script. The wrapper expects:
+Re-running is safe and idempotent. Existing config values take precedence over auto-discovered ones, so fixing one field doesn't require re-typing the rest. Placeholder-looking values (`<PARTNER-APP-CLIENT-ID-GUID>`, etc.) are rejected outright.
 
-- A PowerShell 7+ script, executable as `pwsh -File <path>`.
-- Accepts `-OutputPath <xlsx>` and writes a 16-tab `.xlsx` of M365 posture data.
-- Does its own auth (the wrapper handles per-tenant authentication separately and drops the script into a pre-authenticated context, OR spawns it as a child process; depends on which collector-wiring path you pick).
+If auto-discovery fails (sign-in declined, `Application.Read.All` not consented in your tenant, or zero/many app candidates) the script falls back to manual prompts cleanly. The first time the script runs in a tenant where the partner app hasn't been registered yet, expect this fallback; run `Register-PartnerCenterApp.ps1` first or have someone else hand you the values.
 
 ## Usage
 
