@@ -1,21 +1,20 @@
 <#
 .SYNOPSIS
-    Multi-tenant wrapper for Get-O365MailGroupInventory.ps1 — runs the v1
-    single-tenant inventory across every tenant UOTech has GDAP access to,
-    plus any statically-configured non-GDAP tenants, in one pass. Produces
-    a per-tenant workbook (identical to v1 output) and a roll-up workbook
-    keyed on tenant.
+    Multi-tenant wrapper for Get-O365MailGroupInventory.ps1 — runs the
+    bundled single-tenant inventory script across every tenant a Cloud
+    Solution Provider has GDAP access to, plus any statically-configured
+    non-GDAP tenants, in one pass. Produces a per-tenant workbook
+    (identical to the single-tenant output) and a roll-up workbook keyed
+    on tenant.
 
 .DESCRIPTION
-    STUB. This file lays down the wrapper structure — partner-app auth,
-    GDAP customer enumeration, static-config tenant load, the per-tenant
-    loop, and the roll-up writer. The auth body, the per-tenant collector
-    invocation, and the roll-up writer are all marked TODO. See README.md
-    for the architectural decision still open on how v2 calls v1's
-    collectors (v1's collection logic is inline procedural code, not
-    function-scoped).
-
-    Do NOT run this script as-is. The TODO markers are load-bearing.
+    Process-per-tenant orchestration: the wrapper handles partner-app auth
+    + GDAP enumeration, then spawns the bundled single-tenant script as a
+    child process per customer. v1 does its own connect (delegated GDAP-
+    aware Connect-MgGraph + Connect-ExchangeOnline -DelegatedOrganization)
+    using the multi-tenant params the wrapper passes in. After all tenants
+    finish, the wrapper builds a roll-up workbook by reading each per-tenant
+    Summary tab and projecting the headline counts into one row per tenant.
 
 .PARAMETER ConfigPath
     Path to tenants.config.json. Defaults to ./tenants.config.json. The
@@ -42,9 +41,8 @@
     If set, per-tenant workbooks are produced but the roll-up is not built.
 
 .NOTES
-    Author : Mike Maser, UOTech
+    License: Apache-2.0 (see LICENSE in repo root)
     Created: 2026-05-05
-    Status : Scaffold / stub — not runnable.
 #>
 
 #Requires -Version 7.0
@@ -60,7 +58,12 @@ param(
     # and relies on GDAP/Lighthouse for customer-tenant authorization. Set
     # -AppOnly for unattended/scheduled runs that authenticate via the
     # partner-app cert (loaded from $config.partner.certificatePfxPath).
-    [switch] $AppOnly
+    [switch] $AppOnly,
+
+    # Path to the single-tenant inventory script invoked per customer. Default
+    # is the bundled Get-O365MailGroupInventory.ps1 next to this script. Can be
+    # overridden via param OR config.v1ScriptPath.
+    [string] $V1ScriptPath = (Join-Path $PSScriptRoot 'Get-O365MailGroupInventory.ps1')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -89,18 +92,11 @@ function Write-MultiLog {
 
 Write-MultiLog 'Bootstrapping modules...'
 
-# v1 (the single-tenant inventory script this wrapper drives) ships its own
-# Ensure-Module helper. v1 is NOT bundled with this repo — operators install
-# it separately and point at it via $config.v1ScriptPath. Once the v1-collector
-# wiring path is picked (see README "Status / open items"), this section
-# either dot-sources v1 in library mode, imports a refactored collectors
-# module, or does nothing (process-per-tenant orchestration).
-#
-# TODO: pick wiring path, then either:
-#       . $config.v1ScriptPath
-#         (with $env:O365INV_LIBRARY_MODE = '1' set first if v1 supports it)
-#   OR  Import-Module $config.v1CollectorsModulePath
-#   OR  pass — process-per-tenant doesn't need an in-process load.
+# v1 (the bundled single-tenant inventory script this wrapper drives) handles
+# its own module bootstrap inside its child process. The parent process only
+# needs Microsoft.Graph.Authentication for the partner-tenant connect + GDAP
+# enumeration, plus ImportExcel for the rollup writer (loaded near where
+# they're used).
 
 # ============================================================================
 # Config load
@@ -124,11 +120,22 @@ if (-not $config.partner -or
 # Refuse to run against the schema-example file in version control. Detect
 # placeholder values instead of silently iterating <EXAMPLE-…-TENANT-GUID>
 # entries as if they were real customers.
-$placeholderPattern = '<.*-GUID.*>|<PARTNER-APP-CLIENT-ID-GUID>|<UOTECH-HOME-TENANT-GUID>'
+$placeholderPattern = '<.*-GUID.*>|<PARTNER-APP-CLIENT-ID-GUID>|<HOME-TENANT-ID-GUID>'
 if ($config.partner.clientId -match $placeholderPattern -or
     $config.partner.homeTenantId -match $placeholderPattern) {
     throw "config.partner contains placeholder values (looks like the schema-example tenants.config.json). Copy it to tenants.config.local.json (kept outside git), populate with real values from scripts/Register-PartnerCenterApp.ps1 output, then re-run with -ConfigPath ./tenants.config.local.json."
 }
+
+# Resolve v1 script path. Param overrides config; config overrides default.
+if ($config.v1ScriptPath -and -not $PSBoundParameters.ContainsKey('V1ScriptPath')) {
+    $expanded = $config.v1ScriptPath -replace '^~', $HOME
+    $expanded = [System.Environment]::ExpandEnvironmentVariables($expanded)
+    if ($expanded -and $expanded -notmatch '^<.*>$') { $V1ScriptPath = $expanded }
+}
+if (-not (Test-Path $V1ScriptPath)) {
+    throw "v1 script not found at $V1ScriptPath. Either it's missing from the bundled location, or config.v1ScriptPath / -V1ScriptPath points at the wrong file."
+}
+Write-MultiLog ("v1 script: {0}" -f $V1ScriptPath)
 
 $partnerCert = $null
 
@@ -176,25 +183,37 @@ Write-MultiLog ("Excluding {0} tenant(s) from config.exclude." -f $excludeIds.Co
 # ============================================================================
 
 Write-MultiLog "Connecting to partner home tenant ($($config.partner.homeTenantId))..."
-Write-MultiLog 'STUB: partner-tenant Connect-MgGraph not yet implemented — auth call skipped.' 'WARN'
 
-# TODO: real implementation. Two branches by auth mode:
-#
-# DELEGATED (default; staff workflow):
-#   Connect-MgGraph -TenantId $config.partner.homeTenantId `
-#                   -ClientId $config.partner.clientId `
-#                   -Scopes   'DelegatedAdminRelationship.Read.All','Directory.Read.All' `
-#                   -NoWelcome
-#   The user is prompted (browser/device-code) on first run; subsequent
-#   runs in the same session reuse cached tokens.
-#
-# APP-ONLY (-AppOnly switch; unattended/scheduled):
-#   Connect-MgGraph -TenantId    $config.partner.homeTenantId `
-#                   -ClientId    $config.partner.clientId `
-#                   -Certificate $partnerCert `
-#                   -NoWelcome
-#
-# Confirm Get-MgContext returns the right tenant before proceeding.
+# Make sure Microsoft.Graph.Authentication is available (auto-install on first run).
+if (-not (Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication')) {
+    Write-MultiLog 'Installing Microsoft.Graph.Authentication (CurrentUser scope)...'
+    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+}
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+if ($AppOnly) {
+    Connect-MgGraph -TenantId    $config.partner.homeTenantId `
+                    -ClientId    $config.partner.clientId `
+                    -Certificate $partnerCert `
+                    -NoWelcome
+} else {
+    # Delegated: user signs in interactively under the partner-app clientId.
+    # First run prompts (browser/device-code); subsequent runs in the same
+    # session reuse cached refresh tokens.
+    Connect-MgGraph -TenantId $config.partner.homeTenantId `
+                    -ClientId $config.partner.clientId `
+                    -Scopes   'DelegatedAdminRelationship.Read.All','Directory.Read.All' `
+                    -NoWelcome
+}
+
+$ctx = Get-MgContext
+if (-not $ctx) {
+    throw 'Connect-MgGraph did not produce a context.'
+}
+if ($ctx.TenantId -ne $config.partner.homeTenantId) {
+    throw "Connected to the wrong tenant. Expected $($config.partner.homeTenantId), got $($ctx.TenantId)."
+}
+Write-MultiLog ("Connected. Tenant: {0}  Account: {1}" -f $ctx.TenantId, $ctx.Account)
 
 # ============================================================================
 # GDAP customer enumeration (Step 2)
@@ -204,21 +223,24 @@ $gdapCustomers = @()
 
 if (-not $SkipGdapEnumeration) {
     Write-MultiLog 'Enumerating GDAP customers via /v1.0/tenantRelationships/delegatedAdminCustomers...'
-    Write-MultiLog 'STUB: GDAP enumeration not yet implemented — returning empty list.' 'WARN'
 
-    # TODO: real implementation —
-    #   $next = 'https://graph.microsoft.com/v1.0/tenantRelationships/delegatedAdminCustomers?$top=100'
-    #   while ($next) {
-    #       $page = Invoke-MgGraphRequest -Method GET -Uri $next
-    #       $gdapCustomers += $page.value
-    #       $next = $page.'@odata.nextLink'
-    #   }
-    #
-    # Each customer object has: id (customer tenant id), displayName, defaultDomainName,
-    # tenantId, customerId — schema:
-    # https://learn.microsoft.com/en-us/graph/api/resources/delegatedadmincustomer
+    $next = 'https://graph.microsoft.com/v1.0/tenantRelationships/delegatedAdminCustomers?$top=100'
+    while ($next) {
+        try {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $next
+        } catch {
+            Write-MultiLog ("GDAP enumeration failed: {0}" -f $_.Exception.Message) 'ERROR'
+            $script:RunWarnings.Add([pscustomobject]@{
+                TenantId = '(partner)'; DisplayName = '(partner)'
+                Severity = 'ERROR'; Message = "GDAP enumeration: $($_.Exception.Message)"
+            })
+            break
+        }
+        if ($page.value) { $gdapCustomers += $page.value }
+        $next = $page.'@odata.nextLink'
+    }
 
-    Write-MultiLog ("GDAP enumeration returned {0} customer(s)." -f $gdapCustomers.Count)
+    Write-MultiLog ("GDAP enumeration returned {0} customer(s)." -f @($gdapCustomers).Count)
 } else {
     Write-MultiLog '-SkipGdapEnumeration set; using only statically-configured tenants.'
 }
@@ -290,7 +312,6 @@ if (-not (Test-Path $OutputRoot)) { New-Item -ItemType Directory -Path $OutputRo
 foreach ($tenant in $tenantTargets) {
     $tStart = Get-Date
     Write-MultiLog ("─── {0} ({1}) — {2} ───" -f $tenant.DisplayName, $tenant.ShortName, $tenant.TenantId)
-    Write-MultiLog 'STUB: per-tenant connect + collect not yet implemented — no inventory data captured for this tenant.' 'WARN'
 
     $tenantOutDir = Join-Path $OutputRoot $tenant.ShortName
     if (-not (Test-Path $tenantOutDir)) { New-Item -ItemType Directory -Path $tenantOutDir -Force | Out-Null }
@@ -300,74 +321,46 @@ foreach ($tenant in $tenantTargets) {
     $tenantWarnings = @()
 
     try {
-        # ----- Connect (mode-dispatched per tenants.config.json auth block) -----
-        switch ($tenant.Auth.mode) {
-            'gdap' {
-                # TODO — auth-mode-aware dispatch:
-                #
-                # DELEGATED (default; $AppOnly = $false):
-                #   The running user has GDAP delegated rights in the
-                #   customer tenant via security-group membership. Acquire a
-                #   delegated token for the customer tenant under our
-                #   partner-app's clientId; GDAP propagates the user's role.
-                #
-                #     Connect-MgGraph -TenantId $tenant.TenantId `
-                #                     -ClientId $config.partner.clientId `
-                #                     -Scopes   $script:DelegatedScopesForCustomer `
-                #                     -NoWelcome
-                #
-                #     # EXO uses first-party GDAP delegated auth — no app
-                #     # involvement, just the customer's domain.
-                #     Connect-ExchangeOnline -DelegatedOrganization $tenant.PrimaryDomain `
-                #                            -ShowBanner:$false
-                #
-                # APP-ONLY ($AppOnly = $true):
-                #   Cert-based, app acts on its own behalf. Requires the
-                #   customer tenant to authorize this app's SP either by
-                #   manual consent or via a GDAP role template that
-                #   includes app-management propagation.
-                #
-                #     Connect-MgGraph -TenantId    $tenant.TenantId `
-                #                     -ClientId    $config.partner.clientId `
-                #                     -Certificate $partnerCert `
-                #                     -NoWelcome
-                #     Connect-ExchangeOnline -DelegatedOrganization $tenant.PrimaryDomain `
-                #                            -AppId                 $config.partner.clientId `
-                #                            -Certificate           $partnerCert `
-                #                            -ShowBanner:$false
-            }
-            'app-only-cert' {
-                # TODO: Connect-MgGraph / Connect-ExchangeOnline using the in-tenant
-                #       app reg's clientId + certificateThumbprint from $tenant.Auth.
-            }
-            'stored-credential' {
-                # TODO: resolve secret via Microsoft.PowerShell.SecretManagement
-                #   $sec  = Get-Secret -Vault $tenant.Auth.secretManagement.vaultName `
-                #                      -Name  $tenant.Auth.secretManagement.secretName
-                #   $cred = [pscredential]::new($tenant.Auth.userPrincipalName, $sec)
-                # then Connect-MgGraph + Connect-ExchangeOnline with -Credential.
-                # Caveat: requires CA + MFA exemption on the admin account, or use app-only-cert.
-            }
-            'interactive' {
-                # TODO: Connect-MgGraph -TenantId $tenant.TenantId -Scopes ... -NoWelcome
-                # plus Connect-ExchangeOnline -UserPrincipalName $tenant.Auth.userPrincipalName.
-            }
-            default {
-                throw "Unknown auth.mode '$($tenant.Auth.mode)' for tenant $($tenant.DisplayName)"
-            }
+        # ----- Spawn v1 as a child process for this customer tenant -----
+        # Process-per-tenant orchestration: v1 does its own Connect-MgGraph,
+        # Connect-ExchangeOnline, and Connect-MicrosoftTeams using the multi-
+        # tenant params we pass in. MSAL's token cache is per-user, so the
+        # first customer prompts for sign-in (delegated mode); subsequent
+        # customers in the same run silently use cached refresh tokens.
+        # AppOnly mode is currently delegated-equivalent for the per-customer
+        # call until SP-level GDAP grants are in place — see README.
+
+        $v1Args = @(
+            '-NoProfile',
+            '-NoLogo',
+            '-File', $V1ScriptPath,
+            '-OutputPath', $tenantXlsx,
+            '-TenantId',   $tenant.TenantId,
+            '-ClientId',   $config.partner.clientId
+        )
+        if ($tenant.PrimaryDomain) {
+            $v1Args += @('-DelegatedOrganization', $tenant.PrimaryDomain)
         }
 
-        # ----- Run v1 collectors against this tenant -----
-        # TODO (architectural decision — see README):
-        #   Path 1: dot-sourced & refactored v1 → call each Invoke-O365InventoryCollect-*
-        #           function and capture row arrays into $collected.
-        #   Path 2: library-mode v1 → call $collected = Invoke-O365InventoryCollect.
-        #   Path 3: process-per-tenant → spawn `pwsh -File $config.v1ScriptPath
-        #           -OutputPath $tenantXlsx` with appropriate env vars; parse $tenantXlsx after.
-        #
-        # In Paths 1 and 2, after collection: write $collected to $tenantXlsx using v1's
-        # exact Export-Excel block (factor it out into a Write-O365InventoryWorkbook helper).
+        # Pass through skip flags from the config defaults block.
+        if ($config.defaults) {
+            if ($config.defaults.skipMailboxStats)      { $v1Args += '-SkipMailboxStats' }
+            if ($config.defaults.skipPermissions)       { $v1Args += '-SkipPermissions' }
+            if ($config.defaults.skipUserMailboxes)     { $v1Args += '-SkipUserMailboxes' }
+            if ($config.defaults.skipSharePointStats)   { $v1Args += '-SkipSharePointStats' }
+            if ($config.defaults.skipConditionalAccess) { $v1Args += '-SkipConditionalAccess' }
+            if ($config.defaults.skipAdminPosture)      { $v1Args += '-SkipAdminPosture' }
+        }
 
+        Write-MultiLog ("Invoking v1: pwsh {0}" -f ($v1Args -join ' '))
+        & pwsh @v1Args 2>&1 | ForEach-Object { Write-Host ("    [v1] {0}" -f $_) }
+        $v1Exit = $LASTEXITCODE
+        if ($v1Exit -ne 0) {
+            throw "v1 child process exited with code $v1Exit"
+        }
+        if (-not (Test-Path $tenantXlsx)) {
+            throw "v1 reported success but no workbook at $tenantXlsx"
+        }
         $tenantStatus = 'ok'
     }
     catch {
@@ -381,12 +374,9 @@ foreach ($tenant in $tenantTargets) {
             Message     = $_.Exception.Message
         })
     }
-    finally {
-        # ----- Disconnect (best-effort; never let teardown abort the loop) -----
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-        try { Disconnect-MgGraph                        -ErrorAction SilentlyContinue } catch { }
-        # MicrosoftTeams disconnect — only if v1 connected it; the wiring path will decide.
-    }
+    # No per-tenant disconnect needed: v1 ran in its own child process, which
+    # terminated when the script finished. The parent process keeps its
+    # Microsoft.Graph context (for the GDAP enumeration) until script end.
 
     $tEnd = Get-Date
     $script:RunResults.Add([pscustomobject]@{
@@ -414,29 +404,61 @@ if (-not $SkipRollup) {
 
     Write-MultiLog "Building roll-up workbook at $rollupXlsx..."
 
-    # TODO: build the roll-up tabs. One row per tenant on each headline tab.
-    # Source data depends on the wiring path:
-    #   Paths 1/2: roll-up is built from the in-memory $collected hashtables we
-    #              kept around per tenant — flatten the headline counts into rows.
-    #   Path 3:    roll-up is built by reading each per-tenant xlsx with
-    #              Import-Excel, projecting the Summary-tab counts into a row.
-    #
-    # Headline tabs to produce:
-    #   - Run        : one row per tenant — TenantId, DisplayName, ShortName, Source, AuthMode, Status, DurationSec, OutputPath
-    #   - MFA        : per tenant — admin count, admins MFA-registered, non-MFA admins,
-    #                  admin-MFA coverage %, distinct human admins, GA count, GA non-MFA count.
-    #   - Admin      : per tenant — total admins, eligible-PIM admins, role-holding service principals,
-    #                  role-holding groups, break-glass candidates flagged.
-    #   - CA         : per tenant — total policies, enabled, report-only, disabled,
-    #                  named locations, trusted named locations, auth-strength policies.
-    #   - Capacity   : per tenant — user-mailbox count, total mailbox size GB,
-    #                  M365 group count, Teams count, SharePoint storage GB.
-    #   - License    : per tenant — top SKUs by assignment count.
-    #   - External-Sender : per tenant — accept-from-external CA presence,
-    #                       external-tag enabled, anti-impersonation policies count.
-    #   - Run Issues : flattened from $script:RunWarnings.
-    #
-    # Use the same xlsx style helpers v1 uses (FreezeTopRow, AutoFilter, BoldTopRow, AutoSize).
+    # ImportExcel must be available — v1 uses it too, so it's typically present.
+    if (-not (Get-Module -ListAvailable -Name 'ImportExcel')) {
+        Write-MultiLog 'Installing ImportExcel (CurrentUser scope)...' 'INFO'
+        Install-Module ImportExcel -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module ImportExcel -ErrorAction Stop
+
+    # ----- Run sheet: one row per tenant attempted -----
+    $runRows = @($script:RunResults | Select-Object TenantId, DisplayName, ShortName, PrimaryDomain, Source, AuthMode, Status, DurationSec, OutputPath, WarningCount)
+
+    # ----- Counts sheet: read each per-tenant Summary tab, project to columns -----
+    # v1's Summary tab has metadata at the top (Field/Value rows) followed by
+    # the counts table starting at $meta.Count + 3, with columns Category +
+    # Count. We read every category cell as a column header and put one row
+    # per tenant.
+    $countsRows = @()
+    foreach ($r in ($script:RunResults | Where-Object Status -eq 'ok')) {
+        if (-not $r.OutputPath -or -not (Test-Path $r.OutputPath)) { continue }
+        try {
+            # Pull the full Summary sheet; v1 exports it with no header row,
+            # so first-row-is-data. Filter to rows that look like Category/Count.
+            $summary = Import-Excel -Path $r.OutputPath -WorksheetName 'Summary' -NoHeader -ErrorAction Stop
+            $row = [ordered]@{
+                TenantId    = $r.TenantId
+                DisplayName = $r.DisplayName
+                ShortName   = $r.ShortName
+            }
+            foreach ($cell in $summary) {
+                # cell.P1 is column A, cell.P2 is column B
+                $cat   = $cell.P1
+                $count = $cell.P2
+                if ($cat -and ($count -is [int] -or $count -is [double] -or $count -is [long])) {
+                    # Skip section dividers (rows where Category contains "—")
+                    if ($cat -match '^—.*—$') { continue }
+                    $row[[string]$cat] = $count
+                }
+            }
+            $countsRows += [pscustomobject]$row
+        } catch {
+            Write-MultiLog ("Rollup: failed to read Summary from {0}: {1}" -f $r.OutputPath, $_.Exception.Message) 'WARN'
+        }
+    }
+
+    # ----- Run Issues sheet: every captured warning -----
+    $issueRows = @($script:RunWarnings)
+
+    # ----- Write the workbook -----
+    $xl = @{ AutoSize = $true; AutoFilter = $true; FreezeTopRow = $true; BoldTopRow = $true }
+    if (Test-Path $rollupXlsx) { Remove-Item $rollupXlsx -Force }
+    $runRows | Export-Excel -Path $rollupXlsx -WorksheetName 'Run' @xl
+    if (@($countsRows).Count -gt 0) { $countsRows | Export-Excel -Path $rollupXlsx -WorksheetName 'Counts' @xl }
+    if (@($issueRows).Count -gt 0)  { $issueRows  | Export-Excel -Path $rollupXlsx -WorksheetName 'Run Issues' @xl }
+
+    Write-MultiLog ("Rollup written: {0} tenant rows, {1} counts rows, {2} issues" -f
+        @($runRows).Count, @($countsRows).Count, @($issueRows).Count)
 }
 
 # ============================================================================
@@ -453,3 +475,6 @@ Write-MultiLog ("Done. Tenants attempted: {0}; ok: {1}; error: {2}; elapsed: {3:
 $summaryCsv = Join-Path $OutputRoot ("run-summary_{0}.csv" -f $script:RunStamp)
 $script:RunResults | Export-Csv -NoTypeInformation -Path $summaryCsv
 Write-MultiLog "Per-run summary at $summaryCsv"
+
+# Best-effort disconnect of the parent's Graph context.
+try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }

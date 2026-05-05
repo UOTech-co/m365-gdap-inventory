@@ -125,7 +125,7 @@
     Path to the .pfx file holding the cert + private key. If the file
     exists, it is reused (you'll be prompted for its password). Otherwise
     a new cert is generated and written here. Default:
-    ~/.uotech/m365-multi-tenant-inventory/partner-app.pfx (cross-platform;
+    ~/.m365-multi-tenant-inventory/partner-app.pfx (cross-platform;
     $HOME on macOS/Linux, $env:USERPROFILE on Windows).
 
 .PARAMETER CertValidYears
@@ -183,7 +183,7 @@
 param(
     [string] $AppDisplayName     = 'M365 Multi-Tenant Inventory',
     [string] $CertSubject        = 'CN=M365-Multi-Tenant-Inventory',
-    [string] $CertPfxPath        = (Join-Path $HOME '.uotech/m365-multi-tenant-inventory/partner-app.pfx'),
+    [string] $CertPfxPath        = (Join-Path $HOME '.m365-multi-tenant-inventory/partner-app.pfx'),
     [int]    $CertValidYears     = 2,
     [switch] $ForceNewCert,
     [string] $ConfigPathToUpdate,
@@ -669,9 +669,9 @@ Write-Host ('  certificateThumbprint = "{0}"' -f $cert.Thumbprint)
 Write-Host ('  certificatePfxPath    = "{0}"' -f $CertPfxPath)
 Write-Host ''
 Write-Host 'The wrapper resolves the PFX password from the env var named in'
-Write-Host '  partner.certificatePfxPasswordEnvVar  (default: UOTECH_M365_MULTI_PFX_PASSWORD)'
+Write-Host '  partner.certificatePfxPasswordEnvVar  (default: M365_MULTI_PFX_PASSWORD)'
 Write-Host 'or prompts interactively if the env var is unset. Set it in your shell:'
-Write-Host '  $env:UOTECH_M365_MULTI_PFX_PASSWORD = ''<your-pfx-password>''  # PowerShell'
+Write-Host '  $env:M365_MULTI_PFX_PASSWORD = ''<your-pfx-password>''  # PowerShell'
 Write-Host ''
 if ($failedAssignments.Count -eq 0) {
     Write-Host 'Admin consent: GRANTED programmatically. No manual portal step required.' -ForegroundColor Green

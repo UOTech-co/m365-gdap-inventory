@@ -2,8 +2,8 @@
   "$schema": "./tenants.config.schema.json",
   "_comment": "Schema example for Get-O365MailGroupInventory-Multi.ps1. Copy to tenants.config.local.json (gitignored) and populate with real values via scripts/Setup-LocalConfig.ps1. Default behaviour is to enumerate every GDAP customer; entries in the tenants array either (a) supply auth for a tenant that has no GDAP relationship, or (b) override the auth mode for one that does.",
 
-  "_v1Note": "v1 — the single-tenant inventory script this wrapper drives — is NOT bundled with this repo. Install it separately and point v1ScriptPath at the .ps1 entry point. v1 must be a PowerShell 7+ script that accepts -OutputPath and produces a 16-tab .xlsx of M365 posture data; the wrapper either dot-sources it (library mode) or spawns a child process per tenant, depending on the wiring path you pick (see README).",
-  "v1ScriptPath": "<path to your single-tenant inventory script>",
+  "_v1Note": "v1 (the single-tenant inventory script this wrapper drives) is bundled at ./Get-O365MailGroupInventory.ps1 — the wrapper auto-resolves it relative to its own directory. Override here only if you want to point at a different copy (e.g. a fork on a shared drive).",
+  "v1ScriptPath": null,
 
   "partner": {
     "_comment": "Partner-center app registration in your home tenant. homeTenantId + clientId are ALWAYS required (used by both delegated and app-only auth modes). The cert fields below are required ONLY when running the wrapper with -AppOnly (cert-based unattended runs). Staff running in default delegated mode don't need a cert and can leave the cert fields null.",
@@ -55,7 +55,7 @@
     },
 
     {
-      "_comment": "Example 2 — stored-creds-explicit. Tenant has no GDAP relationship and uses local admin instead. Credentials live in PowerShell SecretManagement; the script resolves them at run time and never reads the secret value into a log. NOTE: as of 2026-05-05 no UOTech customer uses this mode (every customer is on or moving onto GDAP). Kept here purely as a schema example for future contingency.",
+      "_comment": "Example 2 — stored-creds-explicit. Tenant has no GDAP relationship and uses local admin instead. Credentials live in PowerShell SecretManagement; the script resolves them at run time and never reads the secret value into a log. Kept here purely as a schema example.",
       "displayName":   "Example Stored-Cred Tenant",
       "shortName":     "XSC",
       "tenantId":      "<EXAMPLE-STORED-CRED-TENANT-GUID>",
@@ -64,7 +64,7 @@
         "mode":                "stored-credential",
         "userPrincipalName":   "admin@examplestoredcred.onmicrosoft.com",
         "secretManagement": {
-          "vaultName":  "UOTech-Inventory",
+          "vaultName":  "M365-Inventory",
           "secretName": "M365-XSC-Admin-Password"
         },
         "_caveat": "Password-based auth requires a CA exemption (named-location or device filter) and an MFA bypass for this admin account, OR an in-tenant app registration with cert-based auth — see auth.mode=app-only-cert below for the cleaner alternative."

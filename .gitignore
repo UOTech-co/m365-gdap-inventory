@@ -36,7 +36,7 @@ tenants.config.*.json
 # -----------------------------------------------------------------------------
 # Cert material — NEVER commit
 # -----------------------------------------------------------------------------
-# Default PFX path is ~/.uotech/m365-multi-tenant-inventory/partner-app.pfx
+# Default PFX path is ~/.m365-multi-tenant-inventory/partner-app.pfx
 # (outside the repo). These patterns are defensive in case anyone moves a
 # cert under the repo by accident.
 *.pfx

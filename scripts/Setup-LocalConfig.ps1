@@ -23,7 +23,7 @@
 
       Required only with -AppOnly:
         - Certificate thumbprint        (40 hex characters, from registration output)
-        - PFX file path                 (path to the cert; default: ~/.uotech/...)
+        - PFX file path                 (path to the cert; default: ~/.m365-multi-tenant-inventory/partner-app.pfx)
         - PFX password env-var name     (default: M365_MULTI_PFX_PASSWORD)
 
     What it does NOT ask for:
@@ -33,7 +33,7 @@
 
     What it does NOT do:
         - Register the Entra app. That's scripts/Register-PartnerCenterApp.ps1
-          (which Mike runs once for all UOTech operators).
+          (run once by your tenant's Global Admin for all operators).
         - Generate certs. That's also Register-PartnerCenterApp.ps1.
         - Install PowerShell modules. The wrapper handles that on first run.
 
@@ -78,7 +78,7 @@
     # Full setup including cert path, thumbprint, PFX-password env-var name.
 
 .EXAMPLE
-    ./scripts/Setup-LocalConfig.ps1 -ConfigDestination "$HOME/UOTech/m365-multi/tenants.config.local.json"
+    ./scripts/Setup-LocalConfig.ps1 -ConfigDestination "$HOME/.m365-multi-tenant-inventory/tenants.config.local.json"
     # Write the config outside the repo entirely. Belt-and-braces if you
     # don't trust .gitignore alone.
 
@@ -89,7 +89,7 @@
     # Automated provisioning — no prompts.
 
 .NOTES
-    Author : Mike Maser, UOTech
+    License: Apache-2.0 (see LICENSE in repo root)
     Created: 2026-05-05
 #>
 
@@ -211,7 +211,7 @@ if (-not $NonInteractive) {
             -Validator { param($v) Test-Thumb $v }
 
         $defaultPfx = Default-From $existing 'partner.certificatePfxPath'
-        if (-not $defaultPfx) { $defaultPfx = (Join-Path $HOME '.uotech/m365-multi-tenant-inventory/partner-app.pfx') }
+        if (-not $defaultPfx) { $defaultPfx = (Join-Path $HOME '.m365-multi-tenant-inventory/partner-app.pfx') }
         $CertificatePfxPath = Read-Required `
             -Prompt   'PFX file path' `
             -Default  $defaultPfx
