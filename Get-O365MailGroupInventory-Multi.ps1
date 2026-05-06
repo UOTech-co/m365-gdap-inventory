@@ -31,7 +31,21 @@
     Optional. If supplied, runs only the matching tenant — matches against
     tenantId, shortName, or displayName (case-insensitive). Useful for
     re-running a single tenant after a transient failure without rerunning
-    the whole partner population.
+    the whole partner population. Mutually exclusive with -TenantListCsv.
+
+.PARAMETER TenantListCsv
+    Optional. Path to a CSV that defines a subset of customers to process.
+    Header row must include at least one of: TenantId, ShortName,
+    DisplayName, Tenant (case-insensitive; other columns are ignored).
+    Match is case-insensitive against any of the three identifier columns
+    on each tenant row; first match wins. CSV rows that don't match any
+    GDAP tenant are warned and skipped — they don't fail the run.
+    Composes with the preflight CSV verbatim:
+        Import-Csv preflight-results_*.csv |
+            Where-Object Status -eq 'OK' |
+            Export-Csv ok-tenants.csv -NoTypeInformation
+        ./Get-O365MailGroupInventory-Multi.ps1 -TenantListCsv ./ok-tenants.csv -NoConfirm
+    Mutually exclusive with -OnlyTenant.
 
 .PARAMETER SkipGdapEnumeration
     If set, only tenants explicitly listed in tenants.config.json are run.
@@ -66,6 +80,16 @@ param(
     [string] $ConfigPath           = (Join-Path $PSScriptRoot 'tenants.config.json'),
     [string] $OutputRoot           = (Join-Path $PSScriptRoot 'output'),
     [string] $OnlyTenant,
+
+    # Run against a CSV-defined subset of GDAP customers. The CSV must have
+    # a header row including at least one of: TenantId, ShortName,
+    # DisplayName (case-insensitive). Other columns are ignored — the
+    # preflight CSV (Test-TenantPreflight.ps1 -Csv) plugs in directly.
+    # Mutually exclusive with -OnlyTenant. The wrapper still does GDAP
+    # enumeration (and /v1.0/contracts lookup) so domain resolution works;
+    # the filter applies after the tenant target list is built.
+    [string] $TenantListCsv,
+
     [switch] $SkipGdapEnumeration,
     [switch] $SkipRollup,
     # Auth mode. Default = delegated: the running user signs in interactively
@@ -421,6 +445,14 @@ foreach ($t in @($config.tenants)) {
     })
 }
 
+# Mutually-exclusive filters: -OnlyTenant picks one customer; -TenantListCsv
+# picks a CSV-defined subset. They're alternative selectors; allowing both
+# would either be redundant (CSV is a superset of one) or contradictory
+# (CSV doesn't include the OnlyTenant). Bail out cleanly if both supplied.
+if ($OnlyTenant -and $TenantListCsv) {
+    throw "-OnlyTenant and -TenantListCsv are mutually exclusive; pick one. -OnlyTenant for a single customer; -TenantListCsv for a multi-customer subset."
+}
+
 if ($OnlyTenant) {
     $needle = $OnlyTenant.ToLower()
     $tenantTargets = $tenantTargets | Where-Object {
@@ -429,6 +461,83 @@ if ($OnlyTenant) {
         $_.DisplayName.ToLower() -eq $needle
     }
     Write-MultiLog ("Filtered to single tenant: {0}" -f $OnlyTenant)
+}
+
+if ($TenantListCsv) {
+    if (-not (Test-Path $TenantListCsv)) {
+        throw "-TenantListCsv path not found: $TenantListCsv"
+    }
+    Write-MultiLog ("Loading tenant subset from CSV: {0}" -f $TenantListCsv)
+
+    # Read CSV. Tolerate column casing (TenantId / tenantId / TENANTID all work)
+    # by normalizing each row's keys to lowercase.
+    $csvRows = @()
+    try {
+        $csvRows = @(Import-Csv -Path $TenantListCsv)
+    } catch {
+        throw "Failed to read CSV at ${TenantListCsv}: $($_.Exception.Message)"
+    }
+    if (@($csvRows).Count -eq 0) {
+        throw "-TenantListCsv at $TenantListCsv has no rows. Expected at least one row with TenantId / ShortName / DisplayName."
+    }
+
+    # Header sanity check — at least one of our identifier columns must exist.
+    $cols = @($csvRows[0].PSObject.Properties.Name | ForEach-Object { $_.ToLower() })
+    $hasIdentifierCol = ($cols -contains 'tenantid') -or
+                       ($cols -contains 'shortname') -or
+                       ($cols -contains 'displayname') -or
+                       ($cols -contains 'tenant')   # preflight CSV uses 'Tenant'
+    if (-not $hasIdentifierCol) {
+        throw "-TenantListCsv at $TenantListCsv has no recognizable identifier column. Need at least one of: TenantId, ShortName, DisplayName, Tenant. Other columns are ignored."
+    }
+
+    # Build lowercased lookup set from CSV rows.
+    $csvNeedles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $csvRows) {
+        # Resolve each identifier with case-insensitive property lookup.
+        function Get-CsvCol { param($r, [string]$name)
+            $prop = $r.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+            if ($prop) { return [string]$prop.Value } else { return $null }
+        }
+        foreach ($colName in 'TenantId','ShortName','DisplayName','Tenant') {
+            $val = Get-CsvCol $row $colName
+            if ($val -and $val.Trim()) { [void]$csvNeedles.Add($val.Trim()) }
+        }
+    }
+
+    if ($csvNeedles.Count -eq 0) {
+        throw "-TenantListCsv at $TenantListCsv has rows but no non-empty TenantId/ShortName/DisplayName values to match against."
+    }
+
+    # Filter targets — match on any of the three identifiers.
+    $beforeCount = @($tenantTargets).Count
+    $matched = @()
+    $matchedNeedles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in $tenantTargets) {
+        if ($csvNeedles.Contains($t.TenantId) -or
+            ($t.ShortName   -and $csvNeedles.Contains($t.ShortName)) -or
+            ($t.DisplayName -and $csvNeedles.Contains($t.DisplayName))) {
+            $matched += $t
+            # Record which needles matched, so we can warn about the rest.
+            foreach ($n in @($t.TenantId, $t.ShortName, $t.DisplayName)) {
+                if ($n -and $csvNeedles.Contains($n)) { [void]$matchedNeedles.Add($n) }
+            }
+        }
+    }
+
+    # Warn about CSV rows that didn't match any GDAP tenant — typo, offboarded,
+    # whatever. Don't fail the whole run; just surface them so the operator
+    # knows their CSV had stale entries.
+    foreach ($needle in $csvNeedles) {
+        if (-not $matchedNeedles.Contains($needle)) {
+            Write-MultiLog ("CSV row '{0}' didn't match any GDAP tenant — skipped." -f $needle) 'WARN'
+        }
+    }
+
+    $tenantTargets = $matched
+    Write-MultiLog ("Filtered {0} tenants → {1} matching CSV rows." -f $beforeCount, @($tenantTargets).Count)
 }
 
 Write-MultiLog ("Tenant target count: {0}" -f @($tenantTargets).Count)
