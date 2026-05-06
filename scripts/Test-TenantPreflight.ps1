@@ -43,6 +43,20 @@
     Test a single tenant by tenant id or display name (case-insensitive).
     Useful for verifying a customer admin's consent has actually landed.
 
+.PARAMETER Csv
+    Also write the results to a CSV file alongside the on-screen output.
+    With no path argument, writes to ./preflight-results_<timestamp>.csv in
+    the current working directory. The CSV has one row per tenant (passing
+    tenants included with Status=OK so the file is a complete snapshot)
+    and includes the consent URL inline for the NEEDS_CONSENT cases.
+    Useful for MSPs with larger customer bases who want to mail-merge or
+    bulk-process the punchlist.
+
+.PARAMETER CsvPath
+    Explicit path for the CSV output. Implies -Csv. Use when you want a
+    specific filename (e.g. for a scheduled run that overwrites a known
+    location, or for stable diffs between runs).
+
 .EXAMPLE
     ./scripts/Test-TenantPreflight.ps1
     # Test every GDAP customer; print punchlist or success message.
@@ -55,6 +69,15 @@
     ./scripts/Test-TenantPreflight.ps1 -OnlyTenant 00000000-0000-0000-0000-000000000000
     # Same, by tenant id.
 
+.EXAMPLE
+    ./scripts/Test-TenantPreflight.ps1 -Csv
+    # Run against everyone and dump every tenant + status + consent URL
+    # to a timestamped CSV in the cwd alongside the on-screen punchlist.
+
+.EXAMPLE
+    ./scripts/Test-TenantPreflight.ps1 -CsvPath ./reports/preflight-2026-05-06.csv
+    # Same, with an explicit output path.
+
 .NOTES
     License: Apache-2.0 (see LICENSE in repo root)
     Created: 2026-05-05
@@ -65,7 +88,12 @@
 [CmdletBinding()]
 param(
     [string] $ConfigPath = (Join-Path $PSScriptRoot '..' 'tenants.config.local.json'),
-    [string] $OnlyTenant
+    [string] $OnlyTenant,
+
+    # CSV output. -Csv writes to a timestamped path in cwd; -CsvPath overrides
+    # to a specific location and implies -Csv.
+    [switch] $Csv,
+    [string] $CsvPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,6 +104,42 @@ $ErrorActionPreference = 'Stop'
 # in the punchlist consent URLs — we don't authenticate against it here.
 $GraphPsClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 $TeamsPsClientId = '12128f48-ec9e-42f0-b203-ea49fb6af367'
+
+# v1 collector's full Graph scope set. We mirror this list when building the
+# admin-consent URL so the customer admin pre-grants every scope v1 needs.
+# Out of date if v1's $graphScopes drifts; check Get-O365MailGroupInventory.ps1.
+$V1GraphScopes = @(
+    'Group.Read.All','GroupMember.Read.All','User.Read.All',
+    'Team.ReadBasic.All','Channel.ReadBasic.All','Directory.Read.All',
+    'Sites.Read.All','Reports.Read.All','Policy.Read.All',
+    'RoleManagement.Read.Directory','AuditLog.Read.All',
+    'UserAuthenticationMethod.Read.All','Application.Read.All'
+)
+
+function Get-AdminConsentUrl {
+    param([string] $TenantId)
+    # v2.0 /adminconsent with an explicit scope list. Microsoft Graph PowerShell
+    # is a dynamic-scope client, so /adminconsent without /v2.0 (which consents
+    # the app's static requiredResourceAccess) leaves elevated scopes un-granted.
+    # /v2.0/adminconsent accepts a scope= parameter and forces the admin to
+    # consent the listed scopes specifically.
+    #
+    # Note on prompt=admin_consent: that's only valid on the v2.0 /authorize
+    # endpoint paired with response_type=code (and even then it's been
+    # deprecated). On /v2.0/adminconsent the consent itself IS the prompt;
+    # no prompt= parameter needed.
+    $scopeString = ($V1GraphScopes | ForEach-Object { "https://graph.microsoft.com/$_" }) -join ' '
+    $params = @{
+        client_id    = $GraphPsClientId
+        redirect_uri = 'https://login.microsoftonline.com/common/oauth2/nativeclient'
+        scope        = $scopeString
+        state        = [guid]::NewGuid().Guid
+    }
+    $query = ($params.GetEnumerator() | ForEach-Object {
+        '{0}={1}' -f $_.Key, [System.Net.WebUtility]::UrlEncode($_.Value)
+    }) -join '&'
+    "https://login.microsoftonline.com/$TenantId/v2.0/adminconsent?$query"
+}
 
 # ============================================================================
 # Load config
@@ -193,6 +257,9 @@ if ($OnlyTenant) {
 Write-Host '==> Testing each customer tenant...' -ForegroundColor Cyan
 
 $punchlist = @()
+# allResults: every tenant + outcome (including OK), used for CSV output.
+# Punchlist still drives the on-screen output and remains the human-eyes view.
+$allResults = @()
 $total = @($customers).Count
 $idx = 0
 foreach ($c in $customers) {
@@ -216,7 +283,14 @@ foreach ($c in $customers) {
                 scope         = 'https://graph.microsoft.com/Directory.Read.All'
             }
         # Success — the customer tenant has the SP and an admin-consent scope
-        # representative of v1's actual scope set is consented.
+        # representative of the collector's actual scope set is consented.
+        $allResults += [pscustomobject]@{
+            Tenant     = $displayName
+            TenantId   = $tenantId
+            Status     = 'OK'
+            ConsentUrl = ''
+            ErrorDesc  = ''
+        }
     }
     catch {
         $err = $null
@@ -227,26 +301,23 @@ foreach ($c in $customers) {
         $status = $null
         $consentUrls = @()
 
-        # Both AADSTS90099 (no SP at all) and AADSTS65001 (SP exists but the
-        # requested scopes aren't consented in that customer tenant) are
-        # fixable the same way: a Cloud Application Administrator in the
-        # customer tenant has to consent the app + scopes once.
-        #
-        # Empirically: consenting just the Microsoft Graph PowerShell client
-        # is enough to clear preflight for both Graph and Teams. The Teams
-        # PS client uses Graph for inventory-relevant data anyway. So we
-        # only emit the Graph URL.
+        # Both AADSTS90099 (no SP) and AADSTS65001 (SP exists but the
+        # requested scopes aren't admin-consented) need the same fix: a
+        # Cloud Application Administrator in the customer tenant clicks an
+        # /authorize URL with prompt=admin_consent and the full scope list.
+        # The simpler /adminconsent?client_id=X URL only grants the app's
+        # static-declared permissions, which for Microsoft Graph PowerShell
+        # is a small set — the elevated scopes v1 actually requests
+        # (Directory.Read.All, Application.Read.All, etc.) stay un-consented
+        # and the wrapper still fails. The /authorize URL with explicit
+        # scope= and prompt=admin_consent grants every scope listed.
         if ($errDesc -match 'AADSTS90099') {
             $status = 'NEEDS_CONSENT (no SP)'
-            $consentUrls = @(
-                "https://login.microsoftonline.com/$tenantId/adminconsent?client_id=$GraphPsClientId"
-            )
+            $consentUrls = @(Get-AdminConsentUrl -TenantId $tenantId)
         }
         elseif ($errDesc -match 'AADSTS65001') {
             $status = 'NEEDS_CONSENT (scopes)'
-            $consentUrls = @(
-                "https://login.microsoftonline.com/$tenantId/adminconsent?client_id=$GraphPsClientId"
-            )
+            $consentUrls = @(Get-AdminConsentUrl -TenantId $tenantId)
         }
         elseif ($errDesc -match 'AADSTS50020|AADSTS50034|AADSTS50158') {
             # User account doesn't exist in the tenant — usually means GDAP isn't active for this customer
@@ -274,6 +345,15 @@ foreach ($c in $customers) {
             ConsentUrls = $consentUrls
             ErrorDesc   = $errDesc
         }
+        # CSV-friendly mirror — flat row, primary URL only, single-line error.
+        # Newlines in error_description would break Excel CSV import; collapse.
+        $allResults += [pscustomobject]@{
+            Tenant     = $displayName
+            TenantId   = $tenantId
+            Status     = $status
+            ConsentUrl = if (@($consentUrls).Count -gt 0) { $consentUrls[0] } else { '' }
+            ErrorDesc  = ($errDesc -replace '\s+', ' ').Trim()
+        }
     }
 }
 
@@ -284,11 +364,34 @@ Write-Host ''
 # Step 4: output
 # ============================================================================
 
+# CSV emit — runs before the early-return on a clean run AND at the end of
+# the punchlist path. -CsvPath implies -Csv. Default path lands a timestamped
+# file in the cwd so two runs in a row don't clobber each other.
+function Write-PreflightCsv {
+    param([object[]] $Rows, [string] $Path)
+    if (@($Rows).Count -eq 0) { return }
+    $resolvedPath = $Path
+    if (-not $resolvedPath) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
+        $resolvedPath = Join-Path (Get-Location) "preflight-results_$stamp.csv"
+    }
+    $dir = Split-Path -Parent $resolvedPath
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $Rows | Export-Csv -Path $resolvedPath -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Write-Host ('CSV written: {0} ({1} row(s))' -f $resolvedPath, @($Rows).Count) -ForegroundColor Cyan
+}
+
+$wantCsv = $Csv.IsPresent -or $CsvPath
+
 if (@($punchlist).Count -eq 0) {
     Write-Host ''
     Write-Host ('OK — all {0} customer tenant(s) passed the Directory.Read.All refresh-token probe.' -f $total) -ForegroundColor Green
-    Write-Host '   Caveat: preflight uses a refresh-token grant; the wrapper uses interactive browser auth. They mostly agree, but a tenant can pass preflight and still fail the wrapper if the customer''s tenant requires admin consent on first interactive use of the elevated scope set. If that happens, the v1 collector logs the consent URL inline — same fix as a NEEDS_CONSENT punchlist entry.' -ForegroundColor DarkGray
+    Write-Host '   Caveat: preflight uses a refresh-token grant; the wrapper uses interactive browser auth. They mostly agree, but a tenant can pass preflight and still fail the wrapper if the customer''s tenant requires admin consent on first interactive use of the elevated scope set. If that happens, the collector logs the consent URL inline — same fix as a NEEDS_CONSENT punchlist entry.' -ForegroundColor DarkGray
     Write-Host '   Preflight also doesn''t separately verify the Microsoft Teams PowerShell client. Teams data flows through Graph for our inventory, so this rarely matters; if Teams data is empty for a tenant after a real run, send the customer admin the Teams consent URL too.' -ForegroundColor DarkGray
+    if ($wantCsv) { Write-PreflightCsv -Rows $allResults -Path $CsvPath }
     return
 }
 
@@ -368,3 +471,5 @@ if (@($needsConsent).Count -gt 0) {
     Write-Host '  ./scripts/Test-TenantPreflight.ps1 -OnlyTenant ''<display name or tenant id>''' -ForegroundColor White
     Write-Host ''
 }
+
+if ($wantCsv) { Write-PreflightCsv -Rows $allResults -Path $CsvPath }
