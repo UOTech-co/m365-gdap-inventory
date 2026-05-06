@@ -138,7 +138,8 @@ For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-O
 
 | Flag | Effect |
 |---|---|
-| `-OnlyTenant <name-or-guid>` | Run a single tenant. Matches case-insensitively against `tenantId`, `shortName`, or `displayName`. Useful for retrying a failed tenant. |
+| `-OnlyTenant <name-or-guid>` | Run a single tenant. Matches case-insensitively against `tenantId`, `shortName`, or `displayName`. Useful for retrying a failed tenant. Mutually exclusive with `-TenantListCsv`. |
+| `-TenantListCsv <path>` | Restrict the run to the subset of customers listed in a CSV. Header row needs at least one of `TenantId`, `ShortName`, `DisplayName`, or `Tenant`; other columns ignored. Plugs in directly with the preflight `-Csv` output: `Import-Csv preflight-results_*.csv \| Where-Object Status -eq 'OK' \| Export-Csv ok.csv -NoTypeInformation`, then `-TenantListCsv ./ok.csv`. Mutually exclusive with `-OnlyTenant`. |
 | `-SkipGdapEnumeration` | Skip the partner-tenant enumeration; use only tenants explicitly listed in your config. Useful for testing or fallback. |
 | `-SkipRollup` | Produce per-tenant workbooks but skip the rollup. |
 | `-NoConfirm` | Skip the per-tenant Y/n/q prompt entirely. Required for unattended runs. |
