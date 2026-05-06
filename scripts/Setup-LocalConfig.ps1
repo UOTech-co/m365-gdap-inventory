@@ -403,6 +403,30 @@ $out = $source.PSObject.Copy()
 $out.partner.clientId      = $ClientId
 $out.partner.homeTenantId  = $HomeTenantId
 
+# Strip the schema example's tenants[] entries — they're documentation
+# placeholders (<CUSTOMER-A-TENANT-GUID> etc.), not real tenants. If they
+# survive into tenants.config.local.json the wrapper will try to process
+# them as if they were real customers and fail per-tenant. Leave the
+# tenants[] array empty; operators can hand-add genuine static-config
+# entries when they need them (e.g. for tenants without GDAP relationships).
+$placeholderPattern = '<.*>'
+if ($out.PSObject.Properties.Name -contains 'tenants') {
+    $realTenants = @()
+    foreach ($t in @($out.tenants)) {
+        if (-not $t) { continue }
+        $tid    = if ($t.PSObject.Properties.Name -contains 'tenantId')      { $t.tenantId }      else { $null }
+        $tname  = if ($t.PSObject.Properties.Name -contains 'displayName')   { $t.displayName }   else { $null }
+        $tdom   = if ($t.PSObject.Properties.Name -contains 'primaryDomain') { $t.primaryDomain } else { $null }
+        if ($tid   -match $placeholderPattern -or
+            $tname -match $placeholderPattern -or
+            $tdom  -match $placeholderPattern) {
+            continue   # placeholder row — drop
+        }
+        $realTenants += $t
+    }
+    $out.tenants = @($realTenants)
+}
+
 if ($AppOnly) {
     $out.partner.certificateThumbprint        = $CertificateThumbprint
     $out.partner.certificatePfxPath           = $CertificatePfxPath

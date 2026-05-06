@@ -391,8 +391,22 @@ foreach ($gd in $gdapCustomers) {
 }
 
 # Static-only tenants (not in GDAP enumeration).
+# Filter out placeholder rows from the schema example. The schema's
+# tenants[] array carries example entries with placeholder GUIDs like
+# <CUSTOMER-A-TENANT-GUID> as documentation; if an operator copied
+# tenants.config.json to tenants.config.local.json without stripping
+# them, those placeholder rows would be processed as real tenants and
+# blow up on the per-tenant child invocation. Defensively drop anything
+# whose tenantId or primaryDomain looks like a <…> placeholder.
+$placeholderPattern = '<.*>'
 foreach ($t in @($config.tenants)) {
     if (-not $t.tenantId) { continue }
+    if ($t.tenantId -match $placeholderPattern -or
+        ($t.primaryDomain -and $t.primaryDomain -match $placeholderPattern) -or
+        ($t.displayName   -and $t.displayName   -match $placeholderPattern)) {
+        Write-MultiLog ("Skipping placeholder tenant row from config.tenants[]: '{0}' ({1}). Strip example rows from tenants.config.local.json — see tenants.config.json for the schema." -f $t.displayName, $t.tenantId) 'WARN'
+        continue
+    }
     if ($excludeIds -contains $t.tenantId.ToLower()) { continue }
     $alreadyAdded = $tenantTargets | Where-Object { $_.TenantId.ToLower() -eq $t.tenantId.ToLower() } | Select-Object -First 1
     if ($alreadyAdded) { continue }

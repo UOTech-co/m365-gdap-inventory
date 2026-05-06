@@ -826,7 +826,14 @@ try {
         'Get-UnifiedGroup','Get-UnifiedGroupLinks','Get-Recipient','Get-EXORecipient'
     )
     Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false
-} catch { Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'; throw }
+} catch {
+    $exoMsg = $_.Exception.Message
+    Write-Log "Exchange Online connection failed: $exoMsg" 'ERROR'
+    if ($exoMsg -match "role assigned to user .* isn't supported in this scenario|isn't supported in this scenario") {
+        Write-Log "EXO rejected the partner-tenant operator's GDAP role assignment in this customer tenant. None of the Entra roles your GDAP relationship grants you here are recognized by Exchange Online. Fix path: extend the GDAP role template for this customer to include an EXO-recognized role — Global Reader covers the read-only inventory needs cleanly; Exchange Administrator works too if you also need write access. Done in Partner Center → Customers → this customer → Admin relationships → Edit roles, or by sending a fresh GDAP request with the wider template." 'WARN'
+    }
+    throw
+}
 
 $graphConnected = $true
 try {
