@@ -10,12 +10,16 @@
     multi-tab .xlsx workbook.
 
 .DESCRIPTION
-    Single-tenant Microsoft 365 posture inventory. Connects via interactive
-    modern auth (browser popup, MFA-aware) by default, or against a specific
-    customer tenant when -TenantId is supplied (for delegated multi-tenant
-    flows driven by Get-O365MailGroupInventory-Multi.ps1). Pulls structural
-    + usage metadata from Exchange Online, Microsoft Graph, and Microsoft
-    Teams.
+    Per-customer-tenant collector for the GDAP partner inventory tool.
+    Driven by Get-O365MailGroupInventory-Multi.ps1 (the wrapper), one child
+    process per customer. Authenticates as the partner-tenant operator via
+    GDAP-delegated rights and pulls structural + usage metadata from
+    Exchange Online, Microsoft Graph, and Microsoft Teams against the
+    target customer tenant.
+
+    Not intended to be invoked directly. The wrapper passes -TenantId,
+    -ClientId, and -DelegatedOrganization for every customer in scope; the
+    collector fails fast if those are missing.
 
     Workbook tabs produced (in workbook order):
       - Summary             : object counts + run metadata
@@ -176,9 +180,9 @@
 
     License: Apache-2.0 (see LICENSE in repo root)
     Created: 2026-04-30
-    Updated: 2026-05-05 — added -TenantId / -ClientId / -DelegatedOrganization
-                          parameters for delegated multi-tenant flows driven
-                          by Get-O365MailGroupInventory-Multi.ps1.
+    Updated: 2026-05-05 — collector for the GDAP partner inventory tool.
+                          Always driven by Get-O365MailGroupInventory-Multi.ps1.
+                          Standalone single-tenant mode removed.
 #>
 
 #Requires -Version 7.0
@@ -187,20 +191,23 @@
 param(
     [string] $OutputPath = (Join-Path (Get-Location) ("O365-MailGroupInventory_{0}.xlsx" -f (Get-Date -Format 'yyyyMMdd_HHmm'))),
 
-    # Standalone-mode auth: optional UPN to pre-fill the interactive prompt.
-    [string] $UserPrincipalName,
-
-    # Multi-tenant-mode auth (set by Get-O365MailGroupInventory-Multi.ps1):
-    #   -TenantId               target customer tenant id (GUID)
-    #   -ClientId               partner-app clientId (used for delegated Graph + EXO)
-    #   -DelegatedOrganization  customer's primary domain (e.g. customer.onmicrosoft.com),
-    #                           used for Connect-ExchangeOnline -DelegatedOrganization
-    # When all three are supplied, the connect block uses delegated GDAP-aware
-    # auth; the user signing in must hold GDAP-delegated rights in the target
-    # customer tenant for the calls to succeed.
+    # GDAP delegated auth (set by Get-O365MailGroupInventory-Multi.ps1):
+    #   -TenantId               target customer tenant id (GUID, REQUIRED)
+    #   -DelegatedOrganization  customer's primary domain
+    #                           (e.g. customer.onmicrosoft.com, REQUIRED).
+    #                           Used for Connect-ExchangeOnline -DelegatedOrganization.
+    #   -ClientId               partner-app clientId. Accepted for future
+    #                           cert-based app-only flows; intentionally NOT
+    #                           used for delegated Connect-MgGraph (the script
+    #                           falls back to the default Microsoft Graph
+    #                           PowerShell client to dodge AADSTS90099).
+    [Parameter(Mandatory = $true)]
     [string] $TenantId,
-    [string] $ClientId,
+
+    [Parameter(Mandatory = $true)]
     [string] $DelegatedOrganization,
+
+    [string] $ClientId,
 
     [switch] $SkipMailboxStats,
     [switch] $SkipPermissions,
@@ -214,6 +221,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ------------------------------------------------------------------ fail-fast
+# This script is the per-customer-tenant collector for the wrapper at
+# Get-O365MailGroupInventory-Multi.ps1. It is not designed to run standalone.
+# CmdletBinding's Mandatory enforcement covers the explicit-call case, but
+# we double-check here to give a clearer message if someone source-loads it
+# or invokes it from a hand-rolled script that bypasses parameter binding.
+if ([string]::IsNullOrWhiteSpace($TenantId) -or
+    [string]::IsNullOrWhiteSpace($DelegatedOrganization)) {
+    throw "Get-O365MailGroupInventory.ps1 is the per-customer collector for the multi-tenant wrapper. Run Get-O365MailGroupInventory-Multi.ps1 instead — it drives this script with the right parameters per GDAP customer. See README for the wrapper invocation."
+}
 
 # ---------------------------------------------------------------------- helpers
 $script:RunLog = [System.Collections.Generic.List[object]]::new()
@@ -790,18 +808,12 @@ Ensure-Module -Name 'MicrosoftTeams'                  -MinVersion '5.0.0'
 Ensure-Module -Name 'ImportExcel'                     -MinVersion '7.0.0'
 
 # --------------------------------------------------------------------- connect
-# Two auth modes:
-#   - Standalone (default): home-tenant interactive sign-in. Used when running
-#     this script directly against your own tenant.
-#   - Multi-tenant delegated: -TenantId set, optional -DelegatedOrganization for EXO.
-#     Used when the wrapper drives this script against customer tenants via
-#     GDAP/Lighthouse. -ClientId is accepted for future app-only flows but
-#     intentionally NOT used for delegated Connect-MgGraph (AADSTS90099 prevention
-#     — see comment in the connect block below).
-$multiTenantMode = [bool]$TenantId
+# Always delegated GDAP. The wrapper passes -TenantId, -DelegatedOrganization,
+# and -ClientId per customer; the running user's GDAP-delegated rights in the
+# customer tenant authorize every read.
 
 try {
-    Write-Log "Connecting to Exchange Online..."
+    Write-Log "Connecting to Exchange Online (delegated, $DelegatedOrganization)..."
     # The cmdlet set this script needs. Passed as -CommandName so EXO V3
     # explicitly imports them rather than relying on the autoload heuristic
     # (which sometimes fails under -DelegatedOrganization on PS7 — Get-
@@ -813,21 +825,12 @@ try {
         'Get-Place','Get-DistributionGroup','Get-DistributionGroupMember',
         'Get-UnifiedGroup','Get-UnifiedGroupLinks','Get-Recipient','Get-EXORecipient'
     )
-    if ($multiTenantMode -and $DelegatedOrganization) {
-        # Delegated GDAP EXO connect — first-party EXO PowerShell auth, the
-        # running user's GDAP rights authorize the recipient + organization
-        # reads in the customer tenant.
-        Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false
-    } elseif ($UserPrincipalName) {
-        Connect-ExchangeOnline -UserPrincipalName $UserPrincipalName -CommandName $exoCmds -ShowBanner:$false
-    } else {
-        Connect-ExchangeOnline -CommandName $exoCmds -ShowBanner:$false
-    }
+    Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false
 } catch { Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'; throw }
 
 $graphConnected = $true
 try {
-    Write-Log "Connecting to Microsoft Graph..."
+    Write-Log "Connecting to Microsoft Graph (tenant $TenantId)..."
     $graphScopes = [System.Collections.Generic.List[string]]::new()
     # Core inventory
     $graphScopes.AddRange([string[]]@(
@@ -848,56 +851,87 @@ try {
             'Application.Read.All'
         ))
     }
-    if ($multiTenantMode) {
-        # Delegated multi-tenant: token issued for $TenantId. We deliberately
-        # do NOT pass -ClientId — that would route through the caller's custom
-        # partner-app clientId, which most customer tenants haven't authorized
-        # (AADSTS90099: "The application has not been authorized in the tenant").
-        # Standard GDAP role templates don't include Cloud Application
-        # Administrator, so partner-side users can't admin-consent custom apps
-        # in customer tenants on first use. Letting Connect-MgGraph fall back
-        # to the default Microsoft Graph PowerShell client (pre-authorized in
-        # essentially every tenant) sidesteps that. GDAP/Lighthouse roles
-        # still propagate via the running user's identity, not the app.
-        # The $ClientId param remains accepted on this script for future
-        # app-only flows where a custom client is required.
-        Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome
-    } else {
-        Connect-MgGraph -Scopes $graphScopes.ToArray() -NoWelcome
-    }
+    # Delegated multi-tenant: token issued for $TenantId. We deliberately do
+    # NOT pass -ClientId — that would route through the caller's custom
+    # partner-app clientId, which most customer tenants haven't authorized
+    # (AADSTS90099: "The application has not been authorized in the tenant").
+    # Standard GDAP role templates don't include Cloud Application
+    # Administrator, so partner-side users can't admin-consent custom apps in
+    # customer tenants on first use. Letting Connect-MgGraph fall back to the
+    # default Microsoft Graph PowerShell client (pre-authorized in essentially
+    # every tenant after the v2.0/adminconsent flow) sidesteps that. GDAP/
+    # Lighthouse roles still propagate via the running user's identity, not
+    # the app. $ClientId remains accepted for future cert-based app-only flows.
+    Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome
 } catch {
     $exMsg = $_.Exception.Message
     Write-Log "Microsoft Graph connection failed — security-groups, CA, and admin-posture sheets will be skipped: $exMsg" 'WARN'
-    if ($exMsg -match 'AADSTS90099') {
-        Write-Log "AADSTS90099 = the customer tenant has no service principal for the OAuth client we're trying to use. There's no code-side fix." 'WARN'
-        Write-Log "FIX: a Cloud Application Administrator (or Global Administrator) in this customer tenant needs to consent the app once. Send the customer admin this URL:" 'WARN'
-        if ($multiTenantMode) {
-            Write-Log "  https://login.microsoftonline.com/$TenantId/adminconsent?client_id=14d82eec-204b-4c2f-b7e8-296a70dab67e" 'WARN'
-        }
-        Write-Log "Alternatively, extend GDAP role templates to include 'Cloud Application Administrator' so partner-side admins can consent on first use. After consent, future runs against this tenant will succeed." 'WARN'
+    if ($exMsg -match 'AADSTS90099|AADSTS65001') {
+        Write-Log "AADSTS90099/65001 = the Microsoft Graph PowerShell client doesn't have a service principal in this customer tenant, or the SP exists but the elevated scopes this script needs aren't admin-consented. There's no code-side fix." 'WARN'
+        Write-Log "FIX: a Cloud Application Administrator in this customer tenant needs to grant admin consent for the full scope set this script requests. Microsoft Graph PowerShell is a dynamic-scope client, so the simple /adminconsent URL only grants its tiny static scope set — use the v2.0 /adminconsent URL with the explicit scope= parameter instead. Send the customer admin THIS URL:" 'WARN'
+        $scopeList  = ($graphScopes.ToArray() | ForEach-Object { "https://graph.microsoft.com/$_" }) -join ' '
+        $consentUrl = 'https://login.microsoftonline.com/' + $TenantId + '/v2.0/adminconsent?' + (
+            'client_id=14d82eec-204b-4c2f-b7e8-296a70dab67e' +
+            '&redirect_uri=' + [System.Net.WebUtility]::UrlEncode('https://login.microsoftonline.com/common/oauth2/nativeclient') +
+            '&scope=' + [System.Net.WebUtility]::UrlEncode($scopeList) +
+            '&state=' + [guid]::NewGuid().Guid
+        )
+        Write-Log "  $consentUrl" 'WARN'
+        Write-Log "After they click Accept, Microsoft drops them on a 'This is not the right page' / phishing-warning page — that's the normal landing for first-party admin-consent flows; consent did land. They can close the tab. Future runs against this tenant will succeed." 'WARN'
     }
     $graphConnected = $false
 }
 
 $teamsConnected = $true
 try {
-    Write-Log "Connecting to Microsoft Teams..."
-    if ($multiTenantMode) {
-        Connect-MicrosoftTeams -TenantId $TenantId | Out-Null
-    } else {
-        Connect-MicrosoftTeams | Out-Null
-    }
+    Write-Log "Connecting to Microsoft Teams (tenant $TenantId)..."
+    Connect-MicrosoftTeams -TenantId $TenantId | Out-Null
 } catch {
     $exMsg = $_.Exception.Message
     Write-Log "Microsoft Teams connection failed — Teams sheet will be skipped: $exMsg" 'WARN'
-    if ($exMsg -match 'AADSTS90099' -and $multiTenantMode) {
-        Write-Log "Teams Microsoft.Teams app SP is also missing in this customer tenant. Same fix path: customer admin consents at https://login.microsoftonline.com/$TenantId/adminconsent?client_id=12128f48-ec9e-42f0-b203-ea49fb6af367" 'WARN'
+    if ($exMsg -match 'AADSTS90099|AADSTS65001') {
+        Write-Log "Microsoft Teams PowerShell SP is missing or unconsented in this customer tenant. Often the Graph admin-consent URL above pre-creates everything Teams needs too — confirm by re-running. If Teams data is still empty, send a separate consent URL for the Teams client (12128f48-ec9e-42f0-b203-ea49fb6af367)." 'WARN'
     }
     $teamsConnected = $false
 }
 
 $ctx = if ($graphConnected) { Get-MgContext } else { $null }
 if ($ctx) { Write-Log "Tenant: $($ctx.TenantId) | Signed in as: $($ctx.Account)" }
+
+# ---------------------------------------------------- verified-domains cache
+# Pull the customer tenant's verified domains once. Used to gate per-mailbox
+# perms enumeration so we don't waste cycles (and generate 401 noise) calling
+# Get-EXOMailboxPermission against UPNs that obviously can't have a mailbox
+# in this tenant — most commonly the partner-tenant operator's own UPN, which
+# EXO sometimes surfaces as a phantom recipient in delegated GDAP sessions.
+$script:VerifiedDomains = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+if ($graphConnected) {
+    try {
+        $orgResp = Invoke-MgGraphRequest -Method GET -Uri '/v1.0/organization?$select=verifiedDomains' -ErrorAction Stop
+        foreach ($org in @($orgResp.value)) {
+            foreach ($d in @($org.verifiedDomains)) {
+                if ($d -and $d.name) { [void]$script:VerifiedDomains.Add($d.name) }
+            }
+        }
+        Write-Log "Verified domains for this tenant: $($script:VerifiedDomains -join ', ')"
+    } catch {
+        Write-Log "Could not fetch verified domains: $($_.Exception.Message). Perms enumeration will run unfiltered." 'WARN'
+    }
+}
+
+function Test-IsCustomerTenantUpn {
+    # Returns $true if the UPN's domain part is in the cached customer-tenant
+    # verified-domains set. Returns $true (open) if the cache is empty (Graph
+    # didn't connect or the org call failed) — better to attempt and fail
+    # noisily than silently drop everything.
+    param([string] $Upn)
+    if ([string]::IsNullOrWhiteSpace($Upn)) { return $false }
+    if ($script:VerifiedDomains.Count -eq 0) { return $true }
+    $domain = ($Upn -split '@')[-1]
+    return $script:VerifiedDomains.Contains($domain)
+}
 
 # ----------------------------------------------------------- license catalog
 # Pull the SKU friendly-name map and the per-user license assignments once
@@ -909,26 +943,34 @@ Initialize-UserLicenseCache
 # --------------------------------------------------------------- shared mailboxes
 Write-Log "Collecting shared mailboxes..."
 $sharedMbxs = Get-EXOMailbox -RecipientTypeDetails SharedMailbox -ResultSize Unlimited -PropertySets All
+$sharedPermsSkipped = 0
 
 $sharedRows = foreach ($m in $sharedMbxs) {
     $stats = $null
     if (-not $SkipMailboxStats) {
         $stats = Try-Block { Get-EXOMailboxStatistics -Identity $m.UserPrincipalName -Properties LastLogonTime,LastUserActionTime } "stats for $($m.DisplayName)"
     }
+    # Gate FullAccess + SendAs perms calls behind the verified-domains check.
+    # SendOnBehalf comes from the mailbox object itself, no extra call — safe
+    # to read regardless. See Test-IsCustomerTenantUpn for rationale.
     $fa = @(); $sa = @(); $sob = @()
     if (-not $SkipPermissions) {
-        $fa = Try-Block {
-            Get-EXOMailboxPermission -Identity $m.UserPrincipalName |
-                Where-Object { $_.User -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
-                               $_.AccessRights -contains 'FullAccess' -and -not $_.Deny } |
-                Select-Object -ExpandProperty User
-        } "FullAccess perms for $($m.DisplayName)"
-        $sa = Try-Block {
-            Get-EXORecipientPermission -Identity $m.UserPrincipalName |
-                Where-Object { $_.Trustee -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
-                               $_.AccessRights -contains 'SendAs' } |
-                Select-Object -ExpandProperty Trustee
-        } "SendAs perms for $($m.DisplayName)"
+        if (Test-IsCustomerTenantUpn $m.UserPrincipalName) {
+            $fa = Try-Block {
+                Get-EXOMailboxPermission -Identity $m.UserPrincipalName |
+                    Where-Object { $_.User -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
+                                   $_.AccessRights -contains 'FullAccess' -and -not $_.Deny } |
+                    Select-Object -ExpandProperty User
+            } "FullAccess perms for $($m.DisplayName)"
+            $sa = Try-Block {
+                Get-EXORecipientPermission -Identity $m.UserPrincipalName |
+                    Where-Object { $_.Trustee -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
+                                   $_.AccessRights -contains 'SendAs' } |
+                    Select-Object -ExpandProperty Trustee
+            } "SendAs perms for $($m.DisplayName)"
+        } else {
+            $sharedPermsSkipped++
+        }
         $sob = @($m.GrantSendOnBehalfTo)
     }
 
@@ -960,10 +1002,11 @@ $sharedRows = foreach ($m in $sharedMbxs) {
         ExchangeObjectId       = $m.ExchangeObjectId
     }
 }
-Write-Log "Shared mailboxes: $($sharedRows.Count)"
+Write-Log "Shared mailboxes: $($sharedRows.Count) (perms skipped on $sharedPermsSkipped cross-tenant UPN(s))"
 
 # ----------------------------------------------------------------- user mailboxes
 $userRows = @()
+$userPermsSkipped = 0
 if (-not $SkipUserMailboxes) {
     Write-Log "Collecting user mailboxes (this may take a while)..."
     $userMbxs = Get-EXOMailbox -RecipientTypeDetails UserMailbox -ResultSize Unlimited -PropertySets All
@@ -973,21 +1016,28 @@ if (-not $SkipUserMailboxes) {
             $stats = Try-Block { Get-EXOMailboxStatistics -Identity $m.UserPrincipalName -Properties LastLogonTime,LastUserActionTime } "stats for $($m.UserPrincipalName)"
         }
         # Same delegate pattern as Shared Mailboxes — FullAccess, SendAs,
-        # SendOnBehalf. Skipped wholesale via -SkipPermissions on huge tenants.
+        # SendOnBehalf. Gated by Test-IsCustomerTenantUpn so we don't waste
+        # cycles on cross-tenant phantom recipients (your partner-tenant
+        # account, mostly). Skipped wholesale via -SkipPermissions on huge
+        # tenants where you only want structural data.
         $fa = @(); $sa = @(); $sob = @()
         if (-not $SkipPermissions) {
-            $fa = Try-Block {
-                Get-EXOMailboxPermission -Identity $m.UserPrincipalName |
-                    Where-Object { $_.User -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
-                                   $_.AccessRights -contains 'FullAccess' -and -not $_.Deny } |
-                    Select-Object -ExpandProperty User
-            } "FullAccess perms for $($m.UserPrincipalName)"
-            $sa = Try-Block {
-                Get-EXORecipientPermission -Identity $m.UserPrincipalName |
-                    Where-Object { $_.Trustee -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
-                                   $_.AccessRights -contains 'SendAs' } |
-                    Select-Object -ExpandProperty Trustee
-            } "SendAs perms for $($m.UserPrincipalName)"
+            if (Test-IsCustomerTenantUpn $m.UserPrincipalName) {
+                $fa = Try-Block {
+                    Get-EXOMailboxPermission -Identity $m.UserPrincipalName |
+                        Where-Object { $_.User -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
+                                       $_.AccessRights -contains 'FullAccess' -and -not $_.Deny } |
+                        Select-Object -ExpandProperty User
+                } "FullAccess perms for $($m.UserPrincipalName)"
+                $sa = Try-Block {
+                    Get-EXORecipientPermission -Identity $m.UserPrincipalName |
+                        Where-Object { $_.Trustee -notmatch 'NT AUTHORITY|S-1-5|SELF' -and
+                                       $_.AccessRights -contains 'SendAs' } |
+                        Select-Object -ExpandProperty Trustee
+                } "SendAs perms for $($m.UserPrincipalName)"
+            } else {
+                $userPermsSkipped++
+            }
             $sob = @($m.GrantSendOnBehalfTo)
         }
 
@@ -1016,7 +1066,7 @@ if (-not $SkipUserMailboxes) {
             IsDirSynced           = $m.IsDirSynced
         }
     }
-    Write-Log "User mailboxes: $($userRows.Count)"
+    Write-Log "User mailboxes: $($userRows.Count) (perms skipped on $userPermsSkipped cross-tenant UPN(s))"
 }
 
 # ----------------------------------------------------------- resource mailboxes
@@ -1495,70 +1545,22 @@ if (-not $SkipAdminPosture -and $graphConnected) {
 
     # --- Active role memberships (permanent + currently-activated PIM) ---
     #
-    # In a PIM-managed tenant, /roleManagement/directory/roleAssignments
-    # returns only the few *direct* assignments and silently omits the
-    # majority of admins (who are eligible via PIM and activate on demand).
-    # /directoryRoles + /directoryRoles/{id}/members captures the full
-    # currently-active set: direct assignments + active PIM activations
-    # in one model.
+    # /roleManagement/directory/roleAssignments?$expand=principal is the
+    # unified Microsoft Graph endpoint and returns active role assignments
+    # (direct + active-PIM-activated) in a single GDAP-safe call. Earlier
+    # builds also walked /directoryRoles + /directoryRoles/{id}/members,
+    # but that legacy pair returns BadRequest in delegated/GDAP contexts
+    # for many built-in roles, producing one WARN per role. Removed.
     #
-    # /directoryRoles only enumerates roles that have at least one member.
-    # We synthesize an "assignment record" per (role, member) tuple so the
-    # downstream rollup logic doesn't need to know where the data came from.
-    Write-Log "Collecting active directory-role memberships via /directoryRoles..."
-    $activatedRoles = @(Get-GraphPagedValues -Uri "/v1.0/directoryRoles" -Context "Get activated directory roles")
-    Write-Log "Activated directory roles: $($activatedRoles.Count)"
-
-    $activeAssignments = @()
-    foreach ($role in $activatedRoles) {
-        if (-not $role -or -not $role.id) { continue }
-        $members = @(Get-GraphPagedValues -Uri "/v1.0/directoryRoles/$($role.id)/members" -Context "Get members of role $($role.displayName)")
-        foreach ($m in $members) {
-            if (-not $m -or -not $m.id) { continue }
-            # Cache the role definition under its template id so the
-            # role-name lookup doesn't need a separate roleDefinitions call.
-            $rdId = $role.roleTemplateId
-            if ($rdId -and -not $roleDefById.ContainsKey($rdId)) {
-                $roleDefById[$rdId] = [pscustomobject]@{
-                    id          = $rdId
-                    displayName = $role.displayName
-                    description = $role.description
-                    isBuiltIn   = $true
-                    isEnabled   = $true
-                }
-            }
-            $activeAssignments += [pscustomobject]@{
-                principalId      = $m.id
-                principal        = $m
-                roleDefinitionId = $rdId
-                roleDefinition   = [pscustomobject]@{ id = $rdId; displayName = $role.displayName }
-                directoryScopeId = '/'
-                id               = "$($role.id):$($m.id)"
-            }
-        }
-    }
-    Write-Log "Active role memberships (directoryRoles): $($activeAssignments.Count)"
-
-    # Supplementary pull: roleAssignments. In rare cases (e.g. application-
-    # scoped role assignments, unified-RBAC-only resource scopes) an
-    # assignment lives only here. Dedupe by (principalId, roleDefinitionId).
-    $supplementaryAssignments = @(Get-GraphPagedValues -Uri "/v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -Context "Get supplementary roleAssignments")
-    if ($supplementaryAssignments.Count -gt 0) {
-        $existingKeys = @{}
-        foreach ($a in $activeAssignments) {
-            $existingKeys["$($a.principalId)|$($a.roleDefinitionId)"] = $true
-        }
-        $added = 0
-        foreach ($a in $supplementaryAssignments) {
-            if (-not $a -or -not $a.principalId -or -not $a.roleDefinitionId) { continue }
-            $k = "$($a.principalId)|$($a.roleDefinitionId)"
-            if ($existingKeys.ContainsKey($k)) { continue }
-            $activeAssignments += $a
-            $existingKeys[$k] = $true
-            $added++
-        }
-        Write-Log "roleAssignments supplementary: $($supplementaryAssignments.Count) total, $added unique additions"
-    }
+    # PIM-eligible roles (people who can activate but currently aren't) are
+    # collected separately below from /roleEligibilityScheduleInstances.
+    Write-Log "Collecting active directory-role assignments..."
+    $activeAssignments = @(Get-GraphPagedValues -Uri "/v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -Context "Get directory-role assignments")
+    # Filter out malformed rows up front so downstream code doesn't have to.
+    $activeAssignments = @($activeAssignments | Where-Object {
+        $_ -and $_.principalId -and $_.roleDefinitionId
+    })
+    Write-Log "Active role assignments: $($activeAssignments.Count)"
 
     # --- PIM eligibility (current-state instances, not the recurring schedule).
     #     Returns empty on tenants without Entra ID P2 / PIM licensing. ---

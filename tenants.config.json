@@ -2,8 +2,8 @@
   "$schema": "./tenants.config.schema.json",
   "_comment": "Schema example for Get-O365MailGroupInventory-Multi.ps1. Copy to tenants.config.local.json (gitignored) and populate with real values via scripts/Setup-LocalConfig.ps1. Default behaviour is to enumerate every GDAP customer; entries in the tenants array either (a) supply auth for a tenant that has no GDAP relationship, or (b) override the auth mode for one that does.",
 
-  "_v1Note": "v1 (the single-tenant inventory script this wrapper drives) is bundled at ./Get-O365MailGroupInventory.ps1 — the wrapper auto-resolves it relative to its own directory. Override here only if you want to point at a different copy (e.g. a fork on a shared drive).",
-  "v1ScriptPath": null,
+  "_collectorNote": "The per-tenant collector this wrapper drives is bundled at ./Get-O365MailGroupInventory.ps1 — the wrapper auto-resolves it relative to its own directory. Override here only if you want to point at a different copy (e.g. a fork on a shared drive). Legacy key 'v1ScriptPath' still accepted for backward compatibility with older local configs.",
+  "collectorScriptPath": null,
 
   "partner": {
     "_comment": "Partner-center app registration in your home tenant. homeTenantId + clientId are ALWAYS required (used by both delegated and app-only auth modes). The cert fields below are required ONLY when running the wrapper with -AppOnly (cert-based unattended runs). Staff running in default delegated mode don't need a cert and can leave the cert fields null.",
