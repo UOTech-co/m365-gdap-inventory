@@ -1,18 +1,18 @@
 # m365-multi-tenant-inventory
 
-A PowerShell 7 toolkit that runs a Microsoft 365 posture inventory across every customer a Cloud Solution Provider has GDAP access to, in one pass. Produces per-tenant Excel workbooks plus a cross-tenant rollup keyed on tenant id. Self-contained: ships both the multi-tenant orchestrator and the single-tenant collection script in one repo.
+A PowerShell 7 toolkit that runs a Microsoft 365 posture inventory across every customer a Cloud Solution Provider has GDAP access to, in one pass. Produces per-tenant Excel workbooks plus a cross-tenant rollup keyed on tenant id. The wrapper enumerates GDAP customers from your partner tenant and drives the bundled per-tenant collector against each one as a child process. Built exclusively for GDAP-driven multi-tenant inventory; not intended for standalone single-tenant use.
 
 ## What's in the box
 
-- `Get-O365MailGroupInventory-Multi.ps1` — the multi-tenant orchestrator. Authenticates against your partner tenant, enumerates GDAP customers, drives the single-tenant script per customer, builds the rollup.
-- `Get-O365MailGroupInventory.ps1` — the single-tenant collection script. Connects to a customer tenant via Microsoft Graph + Exchange Online + Microsoft Teams and writes a 16-tab `.xlsx` of posture data (mailboxes, groups, Teams, Conditional Access, directory roles, admin users, break-glass candidates). Runs standalone against your own tenant or as a child process driven by the orchestrator.
+- `Get-O365MailGroupInventory-Multi.ps1` — the wrapper. Authenticates against your partner tenant, enumerates GDAP customers, drives the per-tenant collector per customer, builds the rollup.
+- `Get-O365MailGroupInventory.ps1` — the per-tenant collector. Invoked once per customer by the wrapper as a child process. Connects to the target customer tenant via GDAP-delegated Microsoft Graph + Exchange Online (`-DelegatedOrganization`) + Microsoft Teams and writes a 16-tab `.xlsx` of posture data (mailboxes, groups, Teams, Conditional Access, directory roles, admin users, break-glass candidates). Not designed to be run directly — fails fast if `-TenantId` and `-DelegatedOrganization` aren't supplied.
 - `scripts/Register-PartnerCenterApp.ps1` — one-time partner-app registration with the right permissions and admin consent applied programmatically.
 - `scripts/Setup-LocalConfig.ps1` — interactive config setup. Run once per operator machine.
 - `scripts/Test-TenantPreflight.ps1` — pre-flight validation. Silently tests every GDAP customer tenant and prints a punchlist of the ones that need admin consent or are blocked by Conditional Access, with the consent URL inline.
 
 ## Status
 
-Working end-to-end as of v1.0. Process-per-tenant orchestration: the wrapper handles partner-tenant auth + GDAP enumeration, then spawns the single-tenant script as a child process per customer with the right `-TenantId`, `-ClientId`, and `-DelegatedOrganization` parameters. v1 does its own Connect-* calls inside the child process; MSAL token caching means only the first customer prompts for sign-in.
+Working end-to-end. Process-per-tenant orchestration: the wrapper handles partner-tenant auth + GDAP enumeration, then spawns the collector as a child process per customer with `-TenantId`, `-ClientId`, and `-DelegatedOrganization` set per customer. The collector does its own Connect-* calls inside the child process; MSAL token caching means only the first customer prompts for sign-in.
 
 ## Requirements
 
@@ -124,13 +124,13 @@ A clean pre-flight run prints a one-line success message and writes nothing to d
 
 ### Per-tenant confirmation prompt
 
-By default, the wrapper prompts before each customer tenant with a 30-second auto-Y countdown:
+By default, the wrapper prompts before each customer tenant with a 5-second auto-Y countdown:
 
 ```
-Process 'Acme Corp' (acme.onmicrosoft.com)? [Y/n/q]  (auto-Y in 27s)...
+Process 'Acme Corp' (acme.onmicrosoft.com)? [Y/n/q]  (auto-Y in  4s)...
 ```
 
-The `delegatedAdminCustomers` API includes customer-of-record relationships from offboarded customers; this prompt lets you skip stale ones at runtime instead of polluting the rollup. Press `Y` or Enter to process, `N` to skip (the tenant lands in the run summary with `Status='skipped'`), or `Q` to stop the run entirely (the rollup still gets built from tenants processed up to that point). Any other key accepts the default. Wait 30 seconds and the prompt auto-Y's.
+The `delegatedAdminCustomers` API includes customer-of-record relationships from offboarded customers; this prompt lets you skip stale ones at runtime instead of polluting the rollup. Press `Y` or Enter to process, `N` to skip (the tenant lands in the run summary with `Status='skipped'`), or `Q` to stop the run entirely (the rollup still gets built from tenants processed up to that point). Any other key accepts the default. Wait 5 seconds and the prompt auto-Y's.
 
 For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-OnlyTenant` targets a single tenant and when stdin is redirected.
 
@@ -142,7 +142,7 @@ For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-O
 | `-SkipGdapEnumeration` | Skip the partner-tenant enumeration; use only tenants explicitly listed in your config. Useful for testing or fallback. |
 | `-SkipRollup` | Produce per-tenant workbooks but skip the rollup. |
 | `-NoConfirm` | Skip the per-tenant Y/n/q prompt entirely. Required for unattended runs. |
-| `-ConfirmTimeoutSec <n>` | Per-tenant prompt timeout. Default 30. Set to 0 for no wait (same effect as `-NoConfirm`). |
+| `-ConfirmTimeoutSec <n>` | Per-tenant prompt timeout. Default 5. Set to 0 for no wait (same effect as `-NoConfirm`). |
 | `-OutputRoot <path>` | Override where workbooks land. Default: `./output/`. |
 
 ## Configuration
@@ -153,7 +153,7 @@ Top-level structure:
 
 ```json
 {
-  "v1ScriptPath": "<path to your single-tenant inventory script>",
+  "collectorScriptPath": "<optional override path; defaults to ./Get-O365MailGroupInventory.ps1>",
   "partner": {
     "homeTenantId":          "<HOME-TENANT-ID-GUID>",
     "clientId":              "<PARTNER-APP-CLIENT-ID-GUID>",
@@ -178,17 +178,9 @@ The wrapper supports two auth modes against the same Entra app registration. Bot
 | **Delegated** (default) | Day-to-day operator runs | User signs in interactively against the partner-app's `clientId`. GDAP/Lighthouse propagates the user's role assignments per customer tenant. No cert involved on the operator machine. |
 | **App-only** (`-AppOnly`) | Cron / launchd / Task Scheduler | Cert-based. App authenticates as itself using the PFX. Subject to the SP-level GDAP grant caveat above. |
 
-## Standalone single-tenant mode
+## Collector skip flags
 
-`Get-O365MailGroupInventory.ps1` runs by itself against your own tenant. No wrapper, no GDAP, just an interactive sign-in and a 16-tab xlsx out the other side:
-
-```powershell
-./Get-O365MailGroupInventory.ps1 -OutputPath ./inventory.xlsx
-```
-
-Useful for one-off audits of a single tenant you administer directly. Same script the multi-tenant wrapper drives per customer; the multi-tenant params (`-TenantId`, `-ClientId`, `-DelegatedOrganization`) are simply not supplied in this mode.
-
-Optional flags to skip expensive sections:
+The collector accepts skip flags when sections of the inventory are too expensive or aren't applicable. Configure them in your local config under `defaults` (see Configuration above) and the wrapper threads them through to every per-tenant invocation.
 
 | Flag | What it skips |
 |---|---|
@@ -206,7 +198,7 @@ Process-per-tenant orchestration. The multi-tenant wrapper:
 1. Authenticates against your partner tenant via `Connect-MgGraph` (delegated by default; cert-based with `-AppOnly`).
 2. Enumerates GDAP customers via `GET /v1.0/tenantRelationships/delegatedAdminCustomers` (paginated).
 3. Merges in any statically-configured tenants from `tenants.config.local.json`.
-4. For each customer, spawns the single-tenant script as a child process with `-TenantId <customer>`, `-ClientId <partner-app>`, and `-DelegatedOrganization <customer-domain>`. The child process does its own auth using GDAP/Lighthouse delegation; MSAL token caching means only the first customer prompts for sign-in.
+4. For each customer, spawns the collector as a child process with `-TenantId <customer>`, `-ClientId <partner-app>`, and `-DelegatedOrganization <customer-domain>`. The child process does its own auth using GDAP/Lighthouse delegation; MSAL token caching means only the first customer prompts for sign-in.
 5. Captures the per-tenant xlsx, status, duration, and warnings.
 6. After all customers finish, builds a rollup workbook by reading each per-tenant Summary sheet and projecting the headline counts into one row per tenant. Writes a per-run summary CSV alongside.
 
@@ -219,7 +211,7 @@ Per-tenant runtime is 3–4 minutes; an end-to-end run across ~30 GDAP customers
 ├── .gitignore
 ├── LICENSE
 ├── README.md                                  ← you are here
-├── Get-O365MailGroupInventory.ps1             ← single-tenant collection script
+├── Get-O365MailGroupInventory.ps1             ← per-tenant collector
 ├── Get-O365MailGroupInventory-Multi.ps1       ← multi-tenant wrapper
 ├── tenants.config.json                        ← schema example (with placeholders)
 └── scripts/
@@ -244,7 +236,7 @@ Issues and pull requests welcome. A few conventions:
 
 - Match the existing PowerShell style: verbose comments, defensive error handling, idempotent re-runs.
 - Don't commit real tenant ids, client ids, or cert thumbprints; the schema example uses `<…>` placeholders for a reason.
-- The two scripts share a name prefix on purpose. Changes to the single-tenant script that break its `-TenantId / -ClientId / -DelegatedOrganization` contract also need a wrapper update; please bundle them in one PR.
+- The two scripts share a name prefix on purpose. Changes to the collector that break its `-TenantId / -ClientId / -DelegatedOrganization` contract also need a wrapper update; please bundle them in one PR.
 
 ## License
 
