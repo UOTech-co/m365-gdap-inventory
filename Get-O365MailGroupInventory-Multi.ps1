@@ -9,12 +9,13 @@
 
 .DESCRIPTION
     Process-per-tenant orchestration: the wrapper handles partner-app auth
-    + GDAP enumeration, then spawns the bundled single-tenant script as a
-    child process per customer. v1 does its own connect (delegated GDAP-
-    aware Connect-MgGraph + Connect-ExchangeOnline -DelegatedOrganization)
-    using the multi-tenant params the wrapper passes in. After all tenants
-    finish, the wrapper builds a roll-up workbook by reading each per-tenant
-    Summary tab and projecting the headline counts into one row per tenant.
+    + GDAP enumeration, then spawns the bundled per-tenant collector as a
+    child process per customer. The collector connects to the customer
+    tenant via delegated GDAP (Connect-MgGraph -TenantId, Connect-Exchange-
+    Online -DelegatedOrganization, Connect-MicrosoftTeams -TenantId) using
+    the parameters the wrapper passes in. After all tenants finish, the
+    wrapper builds a roll-up workbook by reading each per-tenant Summary
+    tab and projecting the headline counts into one row per tenant.
 
 .PARAMETER ConfigPath
     Path to tenants.config.json. Defaults to ./tenants.config.json. The
@@ -42,7 +43,7 @@
 
 .PARAMETER NoConfirm
     Skip the per-tenant Y/n/q confirmation prompt. Default is to prompt
-    before each tenant with a 30-second auto-Y countdown so the operator
+    before each tenant with a 5-second auto-Y countdown so the operator
     can skip stale GDAP relationships from offboarded customers at runtime.
     Use -NoConfirm for unattended runs (cron / launchd / Task Scheduler).
     The prompt is also auto-skipped when -OnlyTenant targets a single
@@ -73,21 +74,24 @@ param(
     # partner-app cert (loaded from $config.partner.certificatePfxPath).
     [switch] $AppOnly,
 
-    # Path to the single-tenant inventory script invoked per customer. Default
-    # is the bundled Get-O365MailGroupInventory.ps1 next to this script. Can be
-    # overridden via param OR config.v1ScriptPath.
-    [string] $V1ScriptPath = (Join-Path $PSScriptRoot 'Get-O365MailGroupInventory.ps1'),
+    # Path to the per-tenant collector invoked per customer. Default is the
+    # bundled Get-O365MailGroupInventory.ps1 next to this script. Can be
+    # overridden via param OR config.collectorScriptPath. The historical
+    # config key (v1ScriptPath) and parameter alias (-V1ScriptPath) still
+    # work for backward compatibility with older local configs.
+    [Alias('V1ScriptPath')]
+    [string] $CollectorScriptPath = (Join-Path $PSScriptRoot 'Get-O365MailGroupInventory.ps1'),
 
     # Skip the per-tenant Y/n/q confirmation prompt. Use for unattended runs
     # (cron / launchd / Task Scheduler) where there's no human at the keyboard.
-    # Default behaviour prompts before each tenant with a 30-second auto-Y
+    # Default behaviour prompts before each tenant with a 5-second auto-Y
     # countdown so stale GDAP relationships from offboarded customers can be
     # skipped at runtime.
     [switch] $NoConfirm,
 
     # Per-tenant prompt timeout in seconds. Auto-Y when the countdown elapses.
     # Set to 0 to skip the wait entirely (effectively the same as -NoConfirm).
-    [int] $ConfirmTimeoutSec = 30
+    [int] $ConfirmTimeoutSec = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -156,7 +160,7 @@ function Read-TenantConfirmation {
 
 Write-MultiLog 'Bootstrapping modules...'
 
-# v1 (the bundled single-tenant inventory script this wrapper drives) handles
+# The collector (the bundled per-tenant inventory script this wrapper drives) handles
 # its own module bootstrap inside its child process. The parent process only
 # needs Microsoft.Graph.Authentication for the partner-tenant connect + GDAP
 # enumeration, plus ImportExcel for the rollup writer (loaded near where
@@ -190,16 +194,24 @@ if ($config.partner.clientId -match $placeholderPattern -or
     throw "config.partner contains placeholder values (looks like the schema-example tenants.config.json). Copy it to tenants.config.local.json (kept outside git), populate with real values from scripts/Register-PartnerCenterApp.ps1 output, then re-run with -ConfigPath ./tenants.config.local.json."
 }
 
-# Resolve v1 script path. Param overrides config; config overrides default.
-if ($config.v1ScriptPath -and -not $PSBoundParameters.ContainsKey('V1ScriptPath')) {
-    $expanded = $config.v1ScriptPath -replace '^~', $HOME
+# Resolve collector script path. Param overrides config; config overrides
+# default. Both the new key (collectorScriptPath) and the legacy key
+# (v1ScriptPath) are accepted; the new one wins if both are present.
+$collectorPathFromConfig = $null
+if ($config.collectorScriptPath) { $collectorPathFromConfig = $config.collectorScriptPath }
+elseif ($config.v1ScriptPath)    { $collectorPathFromConfig = $config.v1ScriptPath }
+
+if ($collectorPathFromConfig -and
+    -not $PSBoundParameters.ContainsKey('CollectorScriptPath') -and
+    -not $PSBoundParameters.ContainsKey('V1ScriptPath')) {
+    $expanded = $collectorPathFromConfig -replace '^~', $HOME
     $expanded = [System.Environment]::ExpandEnvironmentVariables($expanded)
-    if ($expanded -and $expanded -notmatch '^<.*>$') { $V1ScriptPath = $expanded }
+    if ($expanded -and $expanded -notmatch '^<.*>$') { $CollectorScriptPath = $expanded }
 }
-if (-not (Test-Path $V1ScriptPath)) {
-    throw "v1 script not found at $V1ScriptPath. Either it's missing from the bundled location, or config.v1ScriptPath / -V1ScriptPath points at the wrong file."
+if (-not (Test-Path $CollectorScriptPath)) {
+    throw "Collector script not found at $CollectorScriptPath. Either it's missing from the bundled location, or config.collectorScriptPath / -CollectorScriptPath points at the wrong file."
 }
-Write-MultiLog ("v1 script: {0}" -f $V1ScriptPath)
+Write-MultiLog ("Collector script: {0}" -f $CollectorScriptPath)
 
 $partnerCert = $null
 
@@ -305,8 +317,34 @@ if (-not $SkipGdapEnumeration) {
     }
 
     Write-MultiLog ("GDAP enumeration returned {0} customer(s)." -f @($gdapCustomers).Count)
+
+    # /tenantRelationships/delegatedAdminCustomers returns id + tenantId +
+    # displayName but NOT the customer's defaultDomainName. /v1.0/contracts
+    # (the CSP-relationship endpoint) does, keyed on customerId. Pull both
+    # and join on tenantId so each customer row carries a domain we can
+    # pass as -DelegatedOrganization to Connect-ExchangeOnline.
+    Write-MultiLog 'Resolving customer default domains via /v1.0/contracts...'
+    $script:DomainByTenantId = @{}
+    $contractsNext = 'https://graph.microsoft.com/v1.0/contracts?$top=100'
+    while ($contractsNext) {
+        try {
+            $page = Invoke-MgGraphRequest -Method GET -Uri $contractsNext
+        } catch {
+            Write-MultiLog ("/v1.0/contracts lookup failed: {0}. PrimaryDomain may be missing on some tenants — populate manually in tenants.config.local.json under config.tenants[].primaryDomain to override." -f $_.Exception.Message) 'WARN'
+            break
+        }
+        foreach ($c in @($page.value)) {
+            $cid = ($c.customerId, $c.tenantId, $c.id | Where-Object { $_ } | Select-Object -First 1)
+            if ($cid -and $c.defaultDomainName) {
+                $script:DomainByTenantId[$cid.ToLower()] = $c.defaultDomainName
+            }
+        }
+        $contractsNext = $page.'@odata.nextLink'
+    }
+    Write-MultiLog ("Resolved domain for {0} customer(s) from /v1.0/contracts." -f $script:DomainByTenantId.Count)
 } else {
     Write-MultiLog '-SkipGdapEnumeration set; using only statically-configured tenants.'
+    $script:DomainByTenantId = @{}
 }
 
 # ============================================================================
@@ -327,11 +365,25 @@ foreach ($gd in $gdapCustomers) {
         continue
     }
     $override = $config.tenants | Where-Object { $_.tenantId -and $_.tenantId.ToLower() -eq $tid.ToLower() } | Select-Object -First 1
+
+    # Resolve PrimaryDomain in priority order:
+    #   1. Static config override (config.tenants[].primaryDomain)
+    #   2. /v1.0/contracts hashtable from the lookup above
+    #   3. defaultDomainName on the GDAP row (rarely populated, but cheap to try)
+    $resolvedDomain = $null
+    if ($override.primaryDomain) {
+        $resolvedDomain = $override.primaryDomain
+    } elseif ($script:DomainByTenantId.ContainsKey($tid.ToLower())) {
+        $resolvedDomain = $script:DomainByTenantId[$tid.ToLower()]
+    } elseif ($gd.defaultDomainName) {
+        $resolvedDomain = $gd.defaultDomainName
+    }
+
     $tenantTargets.Add([pscustomobject]@{
         TenantId       = $tid
         DisplayName    = if ($override.displayName) { $override.displayName } else { $gd.displayName }
         ShortName      = if ($override.shortName)   { $override.shortName }   else { ($gd.displayName -replace '[^A-Za-z0-9]+','-').Trim('-').ToLower() }
-        PrimaryDomain  = if ($override.primaryDomain) { $override.primaryDomain } else { $gd.defaultDomainName }
+        PrimaryDomain  = $resolvedDomain
         Source         = 'gdap'
         Auth           = if ($override.auth) { $override.auth } else { @{ mode = 'gdap' } }
         Overrides      = $override.overrides
@@ -417,45 +469,59 @@ foreach ($tenant in $tenantTargets) {
     $tenantWarnings = @()
 
     try {
-        # ----- Spawn v1 as a child process for this customer tenant -----
-        # Process-per-tenant orchestration: v1 does its own Connect-MgGraph,
-        # Connect-ExchangeOnline, and Connect-MicrosoftTeams using the multi-
-        # tenant params we pass in. MSAL's token cache is per-user, so the
-        # first customer prompts for sign-in (delegated mode); subsequent
+        # ----- Spawn the collector as a child process for this customer ----
+        # Process-per-tenant orchestration: the collector does its own
+        # Connect-MgGraph / Connect-ExchangeOnline / Connect-MicrosoftTeams
+        # using the GDAP delegated params we pass in. MSAL's token cache is
+        # per-user, so the first customer prompts for sign-in; subsequent
         # customers in the same run silently use cached refresh tokens.
-        # AppOnly mode is currently delegated-equivalent for the per-customer
-        # call until SP-level GDAP grants are in place — see README.
+        # -DelegatedOrganization is required by the collector — without a
+        # PrimaryDomain on the tenant row, EXO can't connect.
 
-        $v1Args = @(
+        if (-not $tenant.PrimaryDomain) {
+            # Skip this tenant cleanly rather than throwing — other customers
+            # in this run shouldn't be punished for one missing domain. The
+            # operator can recover by adding `primaryDomain` under
+            # config.tenants[] for this tenantId in tenants.config.local.json.
+            Write-MultiLog ("Tenant '{0}' has no PrimaryDomain (not in /v1.0/contracts and no static override). Skipping. To recover, add this tenant under config.tenants[] with primaryDomain populated, e.g. {{ tenantId='{1}', primaryDomain='customer.onmicrosoft.com' }}." -f $tenant.DisplayName, $tenant.TenantId) 'WARN'
+            $tenantStatus = 'skipped (no PrimaryDomain)'
+            $script:RunWarnings.Add([pscustomobject]@{
+                TenantId    = $tenant.TenantId
+                DisplayName = $tenant.DisplayName
+                Severity    = 'WARN'
+                Message     = 'Skipped: no PrimaryDomain available from /v1.0/contracts or static config.'
+            })
+            continue
+        }
+
+        $collectorArgs = @(
             '-NoProfile',
             '-NoLogo',
-            '-File', $V1ScriptPath,
+            '-File', $CollectorScriptPath,
             '-OutputPath', $tenantXlsx,
             '-TenantId',   $tenant.TenantId,
-            '-ClientId',   $config.partner.clientId
+            '-ClientId',   $config.partner.clientId,
+            '-DelegatedOrganization', $tenant.PrimaryDomain
         )
-        if ($tenant.PrimaryDomain) {
-            $v1Args += @('-DelegatedOrganization', $tenant.PrimaryDomain)
-        }
 
         # Pass through skip flags from the config defaults block.
         if ($config.defaults) {
-            if ($config.defaults.skipMailboxStats)      { $v1Args += '-SkipMailboxStats' }
-            if ($config.defaults.skipPermissions)       { $v1Args += '-SkipPermissions' }
-            if ($config.defaults.skipUserMailboxes)     { $v1Args += '-SkipUserMailboxes' }
-            if ($config.defaults.skipSharePointStats)   { $v1Args += '-SkipSharePointStats' }
-            if ($config.defaults.skipConditionalAccess) { $v1Args += '-SkipConditionalAccess' }
-            if ($config.defaults.skipAdminPosture)      { $v1Args += '-SkipAdminPosture' }
+            if ($config.defaults.skipMailboxStats)      { $collectorArgs += '-SkipMailboxStats' }
+            if ($config.defaults.skipPermissions)       { $collectorArgs += '-SkipPermissions' }
+            if ($config.defaults.skipUserMailboxes)     { $collectorArgs += '-SkipUserMailboxes' }
+            if ($config.defaults.skipSharePointStats)   { $collectorArgs += '-SkipSharePointStats' }
+            if ($config.defaults.skipConditionalAccess) { $collectorArgs += '-SkipConditionalAccess' }
+            if ($config.defaults.skipAdminPosture)      { $collectorArgs += '-SkipAdminPosture' }
         }
 
-        Write-MultiLog ("Invoking v1: pwsh {0}" -f ($v1Args -join ' '))
-        & pwsh @v1Args 2>&1 | ForEach-Object { Write-Host ("    [v1] {0}" -f $_) }
-        $v1Exit = $LASTEXITCODE
-        if ($v1Exit -ne 0) {
-            throw "v1 child process exited with code $v1Exit"
+        Write-MultiLog ("Invoking collector: pwsh {0}" -f ($collectorArgs -join ' '))
+        & pwsh @collectorArgs 2>&1 | ForEach-Object { Write-Host ("    [collector] {0}" -f $_) }
+        $collectorExit = $LASTEXITCODE
+        if ($collectorExit -ne 0) {
+            throw "Collector child process exited with code $collectorExit"
         }
         if (-not (Test-Path $tenantXlsx)) {
-            throw "v1 reported success but no workbook at $tenantXlsx"
+            throw "Collector reported success but no workbook at $tenantXlsx"
         }
         $tenantStatus = 'ok'
     }
@@ -470,9 +536,10 @@ foreach ($tenant in $tenantTargets) {
             Message     = $_.Exception.Message
         })
     }
-    # No per-tenant disconnect needed: v1 ran in its own child process, which
-    # terminated when the script finished. The parent process keeps its
-    # Microsoft.Graph context (for the GDAP enumeration) until script end.
+    # No per-tenant disconnect needed: the collector ran in its own child
+    # process, which terminated when the script finished. The parent process
+    # keeps its Microsoft.Graph context (for the GDAP enumeration) until the
+    # wrapper exits.
 
     $tEnd = Get-Date
     $script:RunResults.Add([pscustomobject]@{
@@ -500,7 +567,7 @@ if (-not $SkipRollup) {
 
     Write-MultiLog "Building roll-up workbook at $rollupXlsx..."
 
-    # ImportExcel must be available — v1 uses it too, so it's typically present.
+    # ImportExcel must be available — the collector uses it too, so it's typically present.
     if (-not (Get-Module -ListAvailable -Name 'ImportExcel')) {
         Write-MultiLog 'Installing ImportExcel (CurrentUser scope)...' 'INFO'
         Install-Module ImportExcel -Scope CurrentUser -Force -AllowClobber
@@ -511,7 +578,7 @@ if (-not $SkipRollup) {
     $runRows = @($script:RunResults | Select-Object TenantId, DisplayName, ShortName, PrimaryDomain, Source, AuthMode, Status, DurationSec, OutputPath, WarningCount)
 
     # ----- Counts sheet: read each per-tenant Summary tab, project to columns -----
-    # v1's Summary tab has metadata at the top (Field/Value rows) followed by
+    # The collector's Summary tab has metadata at the top (Field/Value rows) followed by
     # the counts table starting at $meta.Count + 3, with columns Category +
     # Count. We read every category cell as a column header and put one row
     # per tenant.
@@ -519,7 +586,7 @@ if (-not $SkipRollup) {
     foreach ($r in ($script:RunResults | Where-Object Status -eq 'ok')) {
         if (-not $r.OutputPath -or -not (Test-Path $r.OutputPath)) { continue }
         try {
-            # Pull the full Summary sheet; v1 exports it with no header row,
+            # Pull the full Summary sheet; the collector exports it with no header row,
             # so first-row-is-data. Filter to rows that look like Category/Count.
             $summary = Import-Excel -Path $r.OutputPath -WorksheetName 'Summary' -NoHeader -ErrorAction Stop
             $row = [ordered]@{
