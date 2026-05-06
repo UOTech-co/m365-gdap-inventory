@@ -1,4 +1,4 @@
-# m365-multi-tenant-inventory
+# m365-gdap-inventory
 
 A PowerShell 7 toolkit that runs a Microsoft 365 posture inventory across every customer a Cloud Solution Provider has GDAP access to, in one pass. Produces per-tenant Excel workbooks plus a cross-tenant rollup keyed on tenant id. The wrapper enumerates GDAP customers from your partner tenant and drives the bundled per-tenant collector against each one as a child process. Built exclusively for GDAP-driven multi-tenant inventory; not intended for standalone single-tenant use.
 
@@ -25,8 +25,8 @@ Working end-to-end. Process-per-tenant orchestration: the wrapper handles partne
 
 ```powershell
 # 1. Clone
-git clone <your-fork-url> m365-multi-tenant-inventory
-cd m365-multi-tenant-inventory
+git clone <your-fork-url> m365-gdap-inventory
+cd m365-gdap-inventory
 
 # 2. One-time partner-app registration (run by a Global Admin in your home tenant)
 ./scripts/Register-PartnerCenterApp.ps1
