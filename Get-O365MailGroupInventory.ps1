@@ -189,7 +189,9 @@
 
 [CmdletBinding()]
 param(
-    [string] $OutputPath = (Join-Path (Get-Location) ("O365-MailGroupInventory_{0}.xlsx" -f (Get-Date -Format 'yyyyMMdd_HHmm'))),
+    # Workbook output path. Default is computed below the param block so it
+    # can include $Mode. Wrapper always passes -OutputPath explicitly.
+    [string] $OutputPath,
 
     # GDAP delegated auth (set by Get-O365MailGroupInventory-Multi.ps1):
     #   -TenantId               target customer tenant id (GUID, REQUIRED)
@@ -209,6 +211,22 @@ param(
 
     [string] $ClientId,
 
+    # Collection scope. Each mode gates which collection blocks run AND which
+    # connections (EXO / Graph / Teams) get established — skipping unneeded
+    # connections is the biggest per-tenant time saver (Connect-EXO alone is
+    # 5-15s per tenant). Existing Skip* switches still work as fine-grained
+    # overrides within a mode.
+    #
+    #   Full       — everything (default; current behavior)
+    #   Light      — everything except Conditional Access + Admin Posture
+    #   Security   — only CA + Admin Posture (Graph only; no EXO, no Teams)
+    #   Mailbox    — Shared/User/Resource + DGs + MESGs + Licensing column
+    #   Teams      — only Teams (Graph + Teams; no EXO)
+    #   SharePoint — SP usage report + M365 Groups for context
+    #   Licensing  — only SubscribedSkus + per-user license assignments (Graph only)
+    [ValidateSet('Full','Light','Security','Mailbox','Teams','SharePoint','Licensing')]
+    [string] $Mode = 'Full',
+
     [switch] $SkipMailboxStats,
     [switch] $SkipPermissions,
     [switch] $SkipUserMailboxes,
@@ -219,6 +237,12 @@ param(
     [int]    $InactiveAdminDays = 60,
     [int]    $GroupMemberPreviewCount = 25
 )
+
+# OutputPath default depends on $Mode, which is bound after $OutputPath in the
+# param block, so compute it here.
+if (-not $OutputPath) {
+    $OutputPath = Join-Path (Get-Location) ("O365-MailGroupInventory_{0}_{1}.xlsx" -f $Mode.ToLower(), (Get-Date -Format 'yyyyMMdd_HHmm'))
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -232,6 +256,61 @@ if ([string]::IsNullOrWhiteSpace($TenantId) -or
     [string]::IsNullOrWhiteSpace($DelegatedOrganization)) {
     throw "Get-O365MailGroupInventory.ps1 is the per-customer collector for the multi-tenant wrapper. Run Get-O365MailGroupInventory-Multi.ps1 instead — it drives this script with the right parameters per GDAP customer. See README for the wrapper invocation."
 }
+
+# ------------------------------------------------------------------ mode flags
+# Map the high-level $Mode to per-block collection flags. Each block decides
+# both what gets collected and whether the corresponding tab is exported.
+# Connection setup further down honors $needExo / $needGraph / $needTeams,
+# derived from these flags — skipping unneeded connections is the single
+# biggest per-tenant time saver.
+$collect = [pscustomobject]@{
+    Mailboxes          = $false   # Shared / User / Resource mailbox tabs
+    DistributionGroups = $false   # DGs + Mail-Enabled Sec Groups
+    M365Groups         = $false   # Get-UnifiedGroup + members + Teams cross-ref
+    Teams              = $false   # Microsoft Teams + channels
+    SecurityGroups     = $false   # Cloud (non-mail) security groups via Graph
+    SharePoint         = $false   # SP usage report + dedicated SharePoint tab
+    Licensing          = $false   # Subscribed SKUs + per-user licenses + Licensing tab
+    ConditionalAccess  = $false   # CA policies/locations/strengths/auth methods
+    AdminPosture       = $false   # Directory roles + admin users + admin SPs + break-glass
+}
+switch ($Mode) {
+    'Full' {
+        foreach ($p in $collect.PSObject.Properties.Name) { $collect.$p = $true }
+    }
+    'Light' {
+        foreach ($p in $collect.PSObject.Properties.Name) { $collect.$p = $true }
+        $collect.ConditionalAccess = $false
+        $collect.AdminPosture      = $false
+    }
+    'Security' {
+        $collect.ConditionalAccess = $true
+        $collect.AdminPosture      = $true
+    }
+    'Mailbox' {
+        $collect.Mailboxes          = $true
+        $collect.DistributionGroups = $true
+        $collect.Licensing          = $true   # User Mailboxes' LicenseNames column
+    }
+    'Teams' {
+        $collect.Teams = $true
+    }
+    'SharePoint' {
+        $collect.M365Groups = $true   # source of group→site URL mapping
+        $collect.SharePoint = $true
+    }
+    'Licensing' {
+        $collect.Licensing = $true
+    }
+}
+
+# Connection requirements derived from the flags. Connect-EXO is the most
+# expensive (5-15s per tenant); skipping it for Security/Teams/Licensing/
+# pure-Graph modes is the headline win.
+$needExo   = $collect.Mailboxes -or $collect.DistributionGroups -or $collect.M365Groups
+$needGraph = $collect.Licensing -or $collect.Mailboxes -or $collect.SecurityGroups -or `
+             $collect.SharePoint -or $collect.ConditionalAccess -or $collect.AdminPosture
+$needTeams = $collect.Teams
 
 # ---------------------------------------------------------------------- helpers
 $script:RunLog = [System.Collections.Generic.List[object]]::new()
@@ -299,6 +378,55 @@ function Try-Block {
         return $null
     } finally {
         $ErrorActionPreference = $oldEAP
+    }
+}
+
+function Test-IsInteractiveAuthFailure {
+    # Recognize the failure modes where the embedded MSAL/MSGraph browser pop
+    # is the problem (so device-code is the right retry), versus auth failures
+    # we should NOT retry (bad credentials, blocked by CA, GDAP role gap, etc).
+    #
+    # The headline trigger is the macOS platform exception thrown by MSAL's
+    # NetCorePlatformProxy.StartDefaultOsBrowserAsync when it doesn't recognize
+    # the running OS version (e.g. macOS 26.4.1 against an MSAL build that
+    # only knew macOS up through 14.x). Same shape happens on Linux without a
+    # default browser configured, and on headless / SSH sessions.
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    if (-not $ErrorRecord) { return $false }
+    $ex  = $ErrorRecord.Exception
+    $msg = if ($ex) { $ex.Message } else { '' }
+    # Walk inner exceptions — MSAL frequently wraps the platform exception
+    # inside MsalClientException / AggregateException.
+    $cur = $ex
+    while ($cur) {
+        if ($cur -is [System.PlatformNotSupportedException]) { return $true }
+        $cur = $cur.InnerException
+    }
+    if ($msg -match 'PlatformNotSupportedException') { return $true }
+    if ($msg -match 'StartDefaultOsBrowserAsync')    { return $true }
+    if ($msg -match 'Unable to start the browser')   { return $true }
+    if ($msg -match 'No web browser')                { return $true }
+    if ($msg -match 'macOS \d+\.\d+')                { return $true }   # bare "macOS X.Y" leaks through MSAL on unknown versions
+    return $false
+}
+
+function Invoke-ConnectWithDeviceFallback {
+    # Run an interactive connect; if it fails with a recognized browser-launch
+    # / platform-not-supported error, retry with the cmdlet's device-code
+    # equivalent so the operator can sign in from any browser anywhere.
+    # Other auth failures (bad creds, blocked by CA, GDAP role gap) bubble up
+    # unchanged — device-code wouldn't help for those.
+    param(
+        [Parameter(Mandatory)][string]     $Service,        # 'Exchange Online' / 'Microsoft Graph' / 'Microsoft Teams' (for logging)
+        [Parameter(Mandatory)][scriptblock]$Interactive,    # the normal connect call
+        [Parameter(Mandatory)][scriptblock]$Device          # the same connect with -Device / -UseDeviceCode / -UseDeviceAuthentication
+    )
+    try {
+        & $Interactive
+    } catch {
+        if (-not (Test-IsInteractiveAuthFailure $_)) { throw }
+        Write-Log ("$Service interactive sign-in failed ({0}). Retrying with device-code auth — open the printed verification URL on any device, paste the code, and sign in." -f $_.Exception.Message) 'WARN'
+        & $Device
     }
 }
 
@@ -716,13 +844,16 @@ $script:SkuFriendlyNames = @{
 }
 
 # Caches populated once after Graph connects.
-$script:SkuById      = @{}   # GUID skuId  -> friendly name (or skuPartNumber)
-$script:LicenseByUpn = @{}   # lower(UPN)  -> array of assignedLicenses entries
+$script:SkuById       = @{}   # GUID skuId  -> friendly name (or skuPartNumber)
+$script:SkuCatalog    = @{}   # GUID skuId  -> full /subscribedSkus row (for Licensing tab)
+$script:LicenseByUpn  = @{}   # lower(UPN)  -> array of assignedLicenses entries
 
 function Initialize-SkuCatalog {
     # /subscribedSkus gives us every license SKU in this tenant. We map the
-    # GUID to a friendly name (preferred) or to the skuPartNumber (fallback).
-    $script:SkuById = @{}
+    # GUID to a friendly name (preferred) or to the skuPartNumber (fallback),
+    # and keep the full row for the Licensing tab (consumed/prepaid counts).
+    $script:SkuById    = @{}
+    $script:SkuCatalog = @{}
     if (-not $graphConnected) { return }
     Write-Log "Fetching subscribed SKUs (license catalog)..."
     try {
@@ -738,7 +869,8 @@ function Initialize-SkuCatalog {
             } else {
                 $s.skuId
             }
-            $script:SkuById[[string]$s.skuId] = $name
+            $script:SkuById[[string]$s.skuId]    = $name
+            $script:SkuCatalog[[string]$s.skuId] = $s
         }
         Write-Log "Subscribed SKUs indexed: $($script:SkuById.Count)"
     } catch {
@@ -799,58 +931,79 @@ function Get-LicenseNamesForUpn {
 }
 
 # -------------------------------------------------------------- module bootstrap
-Write-Log "Starting O365 mail/group inventory."
-Ensure-Module -Name 'ExchangeOnlineManagement'        -MinVersion '3.0.0'
-Ensure-Module -Name 'Microsoft.Graph.Authentication'  -MinVersion '2.0.0'
-Ensure-Module -Name 'Microsoft.Graph.Groups'          -MinVersion '2.0.0'
-Ensure-Module -Name 'Microsoft.Graph.Users'           -MinVersion '2.0.0'
-Ensure-Module -Name 'MicrosoftTeams'                  -MinVersion '5.0.0'
-Ensure-Module -Name 'ImportExcel'                     -MinVersion '7.0.0'
+Write-Log "Starting O365 mail/group inventory (mode=$Mode)."
+if ($needExo)   { Ensure-Module -Name 'ExchangeOnlineManagement'        -MinVersion '3.0.0' }
+if ($needGraph) {
+    Ensure-Module -Name 'Microsoft.Graph.Authentication'  -MinVersion '2.0.0'
+    if ($collect.SecurityGroups) {
+        Ensure-Module -Name 'Microsoft.Graph.Groups'      -MinVersion '2.0.0'
+        Ensure-Module -Name 'Microsoft.Graph.Users'       -MinVersion '2.0.0'
+    }
+}
+if ($needTeams) { Ensure-Module -Name 'MicrosoftTeams'                  -MinVersion '5.0.0' }
+Ensure-Module -Name 'ImportExcel'                                       -MinVersion '7.0.0'
 
 # --------------------------------------------------------------------- connect
 # Always delegated GDAP. The wrapper passes -TenantId, -DelegatedOrganization,
 # and -ClientId per customer; the running user's GDAP-delegated rights in the
 # customer tenant authorize every read.
 
-try {
-    Write-Log "Connecting to Exchange Online (delegated, $DelegatedOrganization)..."
-    # The cmdlet set this script needs. Passed as -CommandName so EXO V3
-    # explicitly imports them rather than relying on the autoload heuristic
-    # (which sometimes fails under -DelegatedOrganization on PS7 — Get-
-    # UnifiedGroup in particular has been observed missing without this).
-    $exoCmds = @(
-        'Get-Mailbox','Get-EXOMailbox','Get-MailboxStatistics','Get-EXOMailboxStatistics',
-        'Get-MailboxFolderStatistics','Get-MailboxPermission','Get-EXOMailboxPermission',
-        'Get-RecipientPermission','Get-EXORecipientPermission','Get-CalendarProcessing',
-        'Get-Place','Get-DistributionGroup','Get-DistributionGroupMember',
-        'Get-UnifiedGroup','Get-UnifiedGroupLinks','Get-Recipient','Get-EXORecipient'
-    )
-    Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false
-} catch {
-    $exoMsg = $_.Exception.Message
-    Write-Log "Exchange Online connection failed: $exoMsg" 'ERROR'
-    if ($exoMsg -match "role assigned to user .* isn't supported in this scenario|isn't supported in this scenario") {
-        Write-Log "EXO rejected the partner-tenant operator's GDAP role assignment in this customer tenant. None of the Entra roles your GDAP relationship grants you here are recognized by Exchange Online. Fix path: extend the GDAP role template for this customer to include an EXO-recognized role — Global Reader covers the read-only inventory needs cleanly; Exchange Administrator works too if you also need write access. Done in Partner Center → Customers → this customer → Admin relationships → Edit roles, or by sending a fresh GDAP request with the wider template." 'WARN'
+if ($needExo) {
+    try {
+        Write-Log "Connecting to Exchange Online (delegated, $DelegatedOrganization)..."
+        # The cmdlet set this script needs. Passed as -CommandName so EXO V3
+        # explicitly imports them rather than relying on the autoload heuristic
+        # (which sometimes fails under -DelegatedOrganization on PS7 — Get-
+        # UnifiedGroup in particular has been observed missing without this).
+        $exoCmds = @(
+            'Get-Mailbox','Get-EXOMailbox','Get-MailboxStatistics','Get-EXOMailboxStatistics',
+            'Get-MailboxFolderStatistics','Get-MailboxPermission','Get-EXOMailboxPermission',
+            'Get-RecipientPermission','Get-EXORecipientPermission','Get-CalendarProcessing',
+            'Get-Place','Get-DistributionGroup','Get-DistributionGroupMember',
+            'Get-UnifiedGroup','Get-UnifiedGroupLinks','Get-Recipient','Get-EXORecipient'
+        )
+        Invoke-ConnectWithDeviceFallback `
+            -Service     'Exchange Online' `
+            -Interactive { Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false } `
+            -Device      { Connect-ExchangeOnline -DelegatedOrganization $DelegatedOrganization -CommandName $exoCmds -ShowBanner:$false -Device }
+    } catch {
+        $exoMsg = $_.Exception.Message
+        Write-Log "Exchange Online connection failed: $exoMsg" 'ERROR'
+        if ($exoMsg -match "role assigned to user .* isn't supported in this scenario|isn't supported in this scenario") {
+            Write-Log "EXO rejected the partner-tenant operator's GDAP role assignment in this customer tenant. None of the Entra roles your GDAP relationship grants you here are recognized by Exchange Online. Fix path: extend the GDAP role template for this customer to include an EXO-recognized role — Global Reader covers the read-only inventory needs cleanly; Exchange Administrator works too if you also need write access. Done in Partner Center → Customers → this customer → Admin relationships → Edit roles, or by sending a fresh GDAP request with the wider template." 'WARN'
+        }
+        throw
     }
-    throw
+} else {
+    Write-Log "Skipping Exchange Online connection (mode=$Mode does not require EXO)."
 }
 
+$graphConnected = $false
+if ($needGraph) {
 $graphConnected = $true
 try {
     Write-Log "Connecting to Microsoft Graph (tenant $TenantId)..."
     $graphScopes = [System.Collections.Generic.List[string]]::new()
-    # Core inventory
-    $graphScopes.AddRange([string[]]@(
-        'Group.Read.All','GroupMember.Read.All','User.Read.All',
-        'Team.ReadBasic.All','Channel.ReadBasic.All','Directory.Read.All',
-        'Sites.Read.All','Reports.Read.All'
-    ))
+    # Core inventory — only request the scopes the active mode actually uses.
+    $graphScopes.AddRange([string[]]@('Directory.Read.All'))
+    if ($collect.SecurityGroups -or $collect.M365Groups) {
+        $graphScopes.AddRange([string[]]@('Group.Read.All','GroupMember.Read.All'))
+    }
+    if ($collect.Licensing -or $collect.Mailboxes -or $collect.AdminPosture) {
+        $graphScopes.Add('User.Read.All')
+    }
+    if ($collect.M365Groups -or $collect.Teams) {
+        $graphScopes.AddRange([string[]]@('Team.ReadBasic.All','Channel.ReadBasic.All'))
+    }
+    if ($collect.SharePoint -or $collect.M365Groups) {
+        $graphScopes.AddRange([string[]]@('Sites.Read.All','Reports.Read.All'))
+    }
     # Conditional Access pass
-    if (-not $SkipConditionalAccess) {
+    if ($collect.ConditionalAccess -and -not $SkipConditionalAccess) {
         $graphScopes.Add('Policy.Read.All')
     }
     # Admin posture pass
-    if (-not $SkipAdminPosture) {
+    if ($collect.AdminPosture -and -not $SkipAdminPosture) {
         $graphScopes.AddRange([string[]]@(
             'RoleManagement.Read.Directory',
             'AuditLog.Read.All',
@@ -869,7 +1022,10 @@ try {
     # every tenant after the v2.0/adminconsent flow) sidesteps that. GDAP/
     # Lighthouse roles still propagate via the running user's identity, not
     # the app. $ClientId remains accepted for future cert-based app-only flows.
-    Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome
+    Invoke-ConnectWithDeviceFallback `
+        -Service     'Microsoft Graph' `
+        -Interactive { Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome } `
+        -Device      { Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes.ToArray() -NoWelcome -UseDeviceCode }
 } catch {
     $exMsg = $_.Exception.Message
     Write-Log "Microsoft Graph connection failed — security-groups, CA, and admin-posture sheets will be skipped: $exMsg" 'WARN'
@@ -888,18 +1044,27 @@ try {
     }
     $graphConnected = $false
 }
+} else {
+    Write-Log "Skipping Microsoft Graph connection (mode=$Mode does not require Graph)."
+}
 
-$teamsConnected = $true
-try {
-    Write-Log "Connecting to Microsoft Teams (tenant $TenantId)..."
-    Connect-MicrosoftTeams -TenantId $TenantId | Out-Null
-} catch {
-    $exMsg = $_.Exception.Message
-    Write-Log "Microsoft Teams connection failed — Teams sheet will be skipped: $exMsg" 'WARN'
-    if ($exMsg -match 'AADSTS90099|AADSTS65001') {
-        Write-Log "Microsoft Teams PowerShell SP is missing or unconsented in this customer tenant. Often the Graph admin-consent URL above pre-creates everything Teams needs too — confirm by re-running. If Teams data is still empty, send a separate consent URL for the Teams client (12128f48-ec9e-42f0-b203-ea49fb6af367)." 'WARN'
+$teamsConnected = $false
+if ($needTeams) {
+    $teamsConnected = $true
+    try {
+        Write-Log "Connecting to Microsoft Teams (tenant $TenantId)..."
+        Invoke-ConnectWithDeviceFallback `
+            -Service     'Microsoft Teams' `
+            -Interactive { Connect-MicrosoftTeams -TenantId $TenantId | Out-Null } `
+            -Device      { Connect-MicrosoftTeams -TenantId $TenantId -UseDeviceAuthentication | Out-Null }
+    } catch {
+        $exMsg = $_.Exception.Message
+        Write-Log "Microsoft Teams connection failed — Teams sheet will be skipped: $exMsg" 'WARN'
+        if ($exMsg -match 'AADSTS90099|AADSTS65001') {
+            Write-Log "Microsoft Teams PowerShell SP is missing or unconsented in this customer tenant. Often the Graph admin-consent URL above pre-creates everything Teams needs too — confirm by re-running. If Teams data is still empty, send a separate consent URL for the Teams client (12128f48-ec9e-42f0-b203-ea49fb6af367)." 'WARN'
+        }
+        $teamsConnected = $false
     }
-    $teamsConnected = $false
 }
 
 $ctx = if ($graphConnected) { Get-MgContext } else { $null }
@@ -914,7 +1079,9 @@ if ($ctx) { Write-Log "Tenant: $($ctx.TenantId) | Signed in as: $($ctx.Account)"
 $script:VerifiedDomains = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
-if ($graphConnected) {
+# Verified domains are only used to gate per-mailbox perms enumeration.
+# Skip the call entirely if we're not collecting mailboxes or perms are off.
+if ($graphConnected -and $collect.Mailboxes -and -not $SkipPermissions) {
     try {
         $orgResp = Invoke-MgGraphRequest -Method GET -Uri '/v1.0/organization?$select=verifiedDomains' -ErrorAction Stop
         foreach ($org in @($orgResp.value)) {
@@ -944,13 +1111,21 @@ function Test-IsCustomerTenantUpn {
 # Pull the SKU friendly-name map and the per-user license assignments once
 # up front. After this, every mailbox / admin row resolves licenses out of
 # in-memory hashtables without an extra Graph call.
-Initialize-SkuCatalog
-Initialize-UserLicenseCache
+# Skip entirely in modes that don't need license data (Teams, SharePoint,
+# Security on its own — admin posture optionally consumes the cache for
+# admin-row license summaries; gate that within AdminPosture too).
+$needLicenseCache = $collect.Licensing -or $collect.Mailboxes -or $collect.AdminPosture
+if ($needLicenseCache) {
+    Initialize-SkuCatalog
+    Initialize-UserLicenseCache
+}
 
 # --------------------------------------------------------------- shared mailboxes
+$sharedRows = @()
+$sharedPermsSkipped = 0
+if ($collect.Mailboxes) {
 Write-Log "Collecting shared mailboxes..."
 $sharedMbxs = Get-EXOMailbox -RecipientTypeDetails SharedMailbox -ResultSize Unlimited -PropertySets All
-$sharedPermsSkipped = 0
 
 $sharedRows = foreach ($m in $sharedMbxs) {
     $stats = $null
@@ -1010,11 +1185,12 @@ $sharedRows = foreach ($m in $sharedMbxs) {
     }
 }
 Write-Log "Shared mailboxes: $($sharedRows.Count) (perms skipped on $sharedPermsSkipped cross-tenant UPN(s))"
+}
 
 # ----------------------------------------------------------------- user mailboxes
 $userRows = @()
 $userPermsSkipped = 0
-if (-not $SkipUserMailboxes) {
+if ($collect.Mailboxes -and -not $SkipUserMailboxes) {
     Write-Log "Collecting user mailboxes (this may take a while)..."
     $userMbxs = Get-EXOMailbox -RecipientTypeDetails UserMailbox -ResultSize Unlimited -PropertySets All
     $userRows = foreach ($m in $userMbxs) {
@@ -1077,6 +1253,8 @@ if (-not $SkipUserMailboxes) {
 }
 
 # ----------------------------------------------------------- resource mailboxes
+$resourceRows = @()
+if ($collect.Mailboxes) {
 Write-Log "Collecting resource (room/equipment) mailboxes..."
 $resMbxs = Get-EXOMailbox -RecipientTypeDetails RoomMailbox,EquipmentMailbox -ResultSize Unlimited -PropertySets All
 $resourceRows = foreach ($m in $resMbxs) {
@@ -1106,8 +1284,11 @@ $resourceRows = foreach ($m in $resMbxs) {
     }
 }
 Write-Log "Resource mailboxes: $($resourceRows.Count)"
+}
 
 # ------------------------------------------------------------- distribution groups
+$dgRows = @()
+if ($collect.DistributionGroups) {
 Write-Log "Collecting distribution groups..."
 $dgs = Get-DistributionGroup -ResultSize Unlimited -RecipientTypeDetails 'MailUniversalDistributionGroup','RoomList'
 $dgRows = foreach ($g in $dgs) {
@@ -1138,8 +1319,11 @@ $dgRows = foreach ($g in $dgs) {
     }
 }
 Write-Log "Distribution groups: $($dgRows.Count)"
+}
 
 # ----------------------------------------------------- mail-enabled security groups
+$mesgRows = @()
+if ($collect.DistributionGroups) {
 Write-Log "Collecting mail-enabled security groups..."
 $mesgs = Get-DistributionGroup -ResultSize Unlimited -RecipientTypeDetails MailUniversalSecurityGroup
 $mesgRows = foreach ($g in $mesgs) {
@@ -1164,13 +1348,22 @@ $mesgRows = foreach ($g in $mesgs) {
     }
 }
 Write-Log "Mail-enabled security groups: $($mesgRows.Count)"
+}
 
 # ------------------------------------------------------------ SharePoint usage
 # Pull the SP usage report once before walking M365 Groups / Teams. After
-# this, every per-group SP lookup is an in-memory hashtable hit.
-Initialize-SharePointUsageCache
+# this, every per-group SP lookup is an in-memory hashtable hit. Skip the
+# bulk report fetch entirely in modes that don't need SP enrichment OR a
+# dedicated SharePoint tab.
+if ($collect.SharePoint -or $collect.M365Groups) {
+    Initialize-SharePointUsageCache
+}
 
 # ------------------------------------------------------------------ M365 groups
+$ugs = @()
+$spStatsByGroupId = @{}
+$m365Rows = @()
+if ($collect.M365Groups) {
 Write-Log "Collecting Microsoft 365 (Unified) Groups..."
 
 # Defensive: Get-UnifiedGroup is an EXO implicit-remoting cmdlet. On EXO V3
@@ -1180,16 +1373,12 @@ Write-Log "Collecting Microsoft 365 (Unified) Groups..."
 # tenant run before the workbook export step. Skip the M365 Groups + Teams
 # sections cleanly if Get-UnifiedGroup isn't loaded; downstream code that
 # depends on $ugs already handles empty/null arrays.
-$ugs = $null
 if (Get-Command Get-UnifiedGroup -ErrorAction SilentlyContinue) {
     $ugs = Try-Block { Get-UnifiedGroup -ResultSize Unlimited } "Get-UnifiedGroup -ResultSize Unlimited"
 } else {
     Write-Log "Get-UnifiedGroup not available in this EXO session — M365 Groups + Teams sheets will be empty. (EXO V3 + -DelegatedOrganization sometimes fails to import implicit-remoting cmdlets; this is a known EXO PowerShell limitation, not a permission issue.)" 'WARN'
 }
 if (-not $ugs) { $ugs = @() }
-
-# Cache SP stats per group GUID so the Teams pass reuses the same lookup.
-$spStatsByGroupId = @{}
 
 $m365Rows = foreach ($g in $ugs) {
     $gId         = Resolve-GroupIdentity $g
@@ -1263,10 +1452,11 @@ $m365Rows = foreach ($g in $ugs) {
     }
 }
 Write-Log "M365 Groups: $($m365Rows.Count) (SharePoint enrichment: $(if ($SkipSharePointStats) {'SKIPPED'} else {"$($spStatsByGroupId.Count) sites enriched"}))"
+}
 
 # ----------------------------------------------------------------------- Teams
 $teamRows = @()
-if ($teamsConnected) {
+if ($collect.Teams -and $teamsConnected) {
     Write-Log "Collecting Microsoft Teams..."
     $teams = Try-Block { Get-Team } "Get-Team"
     $teamRows = foreach ($t in $teams) {
@@ -1336,7 +1526,7 @@ if ($teamsConnected) {
 
 # ------------------------------------------------------------ cloud security groups
 $secRows = @()
-if ($graphConnected) {
+if ($collect.SecurityGroups -and $graphConnected) {
     Write-Log "Collecting cloud security groups (non-mail-enabled) via Graph..."
     $secGroups = Try-Block {
         Get-MgGroup -All -ConsistencyLevel eventual -CountVariable c `
@@ -1387,7 +1577,7 @@ $caNamedLocationRows = @()
 $caAuthStrengthRows = @()
 $authMethodsPolicyRows = @()
 
-if (-not $SkipConditionalAccess -and $graphConnected) {
+if ($collect.ConditionalAccess -and -not $SkipConditionalAccess -and $graphConnected) {
     Write-Log "Collecting Conditional Access policies..."
     $caPolicies = Try-Block {
         $resp = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/identity/conditionalAccess/policies?`$top=999" -ErrorAction Stop
@@ -1518,7 +1708,7 @@ $adminUserRows = @()
 $adminSpRows = @()
 $breakGlassRows = @()
 
-if (-not $SkipAdminPosture -and $graphConnected) {
+if ($collect.AdminPosture -and -not $SkipAdminPosture -and $graphConnected) {
 
     # ---- shared paginator for role-management endpoints. The
     # /roleManagement/directory/* endpoints reject $top=999 with a
@@ -1952,46 +2142,147 @@ if (-not $SkipAdminPosture -and $graphConnected) {
 Write-Log "Exporting workbook to: $OutputPath"
 if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
 
-$summary = @(
-    # Mail-flow inventory
-    [pscustomobject]@{ Category = 'Shared Mailboxes';                   Count = @($sharedRows).Count }
-    [pscustomobject]@{ Category = 'User Mailboxes';                     Count = @($userRows).Count }
-    [pscustomobject]@{ Category = 'Resource Mailboxes (Room/Equipment)';Count = @($resourceRows).Count }
-    [pscustomobject]@{ Category = 'Distribution Groups';                Count = @($dgRows).Count }
-    [pscustomobject]@{ Category = 'Mail-Enabled Security Groups';       Count = @($mesgRows).Count }
-    [pscustomobject]@{ Category = 'M365 Groups (Unified)';              Count = @($m365Rows).Count }
-    [pscustomobject]@{ Category = '  -> Teams-provisioned';             Count = @($m365Rows | Where-Object { $_.IsTeamProvisioned }).Count }
-    [pscustomobject]@{ Category = 'Microsoft Teams';                    Count = @($teamRows).Count }
-    [pscustomobject]@{ Category = 'Cloud Security Groups (non-mail)';   Count = @($secRows).Count }
-    # Conditional Access
-    [pscustomobject]@{ Category = '— CA —';                              Count = $null }
-    [pscustomobject]@{ Category = 'CA Policies (total)';                 Count = @($caPolicyRows).Count }
-    [pscustomobject]@{ Category = '  -> enabled';                        Count = @($caPolicyRows | Where-Object { $_.State -eq 'enabled' }).Count }
-    [pscustomobject]@{ Category = '  -> report-only';                    Count = @($caPolicyRows | Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' }).Count }
-    [pscustomobject]@{ Category = '  -> disabled';                       Count = @($caPolicyRows | Where-Object { $_.State -eq 'disabled' }).Count }
-    [pscustomobject]@{ Category = 'CA Named Locations';                  Count = @($caNamedLocationRows).Count }
-    [pscustomobject]@{ Category = '  -> trusted';                        Count = @($caNamedLocationRows | Where-Object { $_.IsTrusted }).Count }
-    [pscustomobject]@{ Category = 'CA Authentication-Strength Policies'; Count = @($caAuthStrengthRows).Count }
-    [pscustomobject]@{ Category = 'Authentication-Methods Policy entries';Count = @($authMethodsPolicyRows).Count }
-    [pscustomobject]@{ Category = '  -> methods enabled';                Count = @($authMethodsPolicyRows | Where-Object { $_.State -eq 'enabled' }).Count }
-    # Admin posture
-    [pscustomobject]@{ Category = '— Admin posture —';                    Count = $null }
-    [pscustomobject]@{ Category = 'Directory roles with assignments';     Count = @($dirRoleRows).Count }
-    [pscustomobject]@{ Category = 'Admin assignments — active';           Count = @($adminUserRows | Where-Object { $_.AssignmentSource -eq 'Active' }).Count + @($adminSpRows | Where-Object { $_.AssignmentSource -eq 'Active' }).Count }
-    [pscustomobject]@{ Category = 'Admin assignments — eligible (PIM)';   Count = @($adminUserRows | Where-Object { $_.AssignmentSource -eq 'Eligible (PIM)' }).Count + @($adminSpRows | Where-Object { $_.AssignmentSource -eq 'Eligible (PIM)' }).Count }
-    [pscustomobject]@{ Category = 'Distinct human admins';                Count = @($adminUserRows | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
-    [pscustomobject]@{ Category = '  -> Global Administrator role holders';Count = @($adminUserRows | Where-Object { $_.RoleName -eq 'Global Administrator' -and $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
-    [pscustomobject]@{ Category = '  -> admins NOT MFA-registered';       Count = @($adminUserRows | Where-Object { $_.UserPrincipalName -and $_.IsMfaRegistered -eq $false } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
-    [pscustomobject]@{ Category = 'Admin role-holding service principals (distinct)'; Count = @($adminSpRows | Select-Object -ExpandProperty AppId -Unique).Count }
-    [pscustomobject]@{ Category = 'Admin role-holding groups';            Count = @($adminUserRows | Where-Object { $_.UserType -eq 'Group' } | Select-Object -ExpandProperty PrincipalId -Unique).Count }
-    [pscustomobject]@{ Category = 'Break-glass candidates';               Count = @($breakGlassRows).Count }
-)
+# ----- Licensing tab — per-SKU rollup with assignments derived from $script:LicenseByUpn
+$licensingRows = @()
+if ($collect.Licensing -and $script:SkuCatalog -and $script:SkuCatalog.Count -gt 0) {
+    # Build per-SKU assigned-user counts from the per-user license cache.
+    # Walking the cache is cheap (already in memory).
+    $assignedBySkuId = @{}
+    foreach ($upn in $script:LicenseByUpn.Keys) {
+        $arr = @($script:LicenseByUpn[$upn] | Where-Object { $_ -and $_.skuId })
+        foreach ($l in $arr) {
+            $sid = [string]$l.skuId
+            if (-not $assignedBySkuId.ContainsKey($sid)) { $assignedBySkuId[$sid] = 0 }
+            $assignedBySkuId[$sid]++
+        }
+    }
+    $licensingRows = foreach ($sid in $script:SkuCatalog.Keys) {
+        $s = $script:SkuCatalog[$sid]
+        $part = $s.skuPartNumber
+        $friendly = if ($script:SkuById.ContainsKey($sid)) { $script:SkuById[$sid] } else { $part }
+        $assigned = if ($assignedBySkuId.ContainsKey($sid)) { $assignedBySkuId[$sid] } else { 0 }
+        $prepaid  = if ($s.prepaidUnits -and $s.prepaidUnits.enabled) { [int]$s.prepaidUnits.enabled } else { $null }
+        $consumed = if ($null -ne $s.consumedUnits) { [int]$s.consumedUnits } else { $null }
+        $available = if ($null -ne $prepaid) { $prepaid - $assigned } else { $null }
+        [pscustomobject]@{
+            FriendlyName  = $friendly
+            SkuPartNumber = $part
+            SkuId         = $sid
+            ConsumedUnits = $consumed
+            PrepaidUnits  = $prepaid
+            AssignedUsers = $assigned
+            AvailableUnits= $available
+            CapabilityStatus = $s.capabilityStatus
+            AppliesTo     = $s.appliesTo
+        }
+    }
+    $licensingRows = @($licensingRows | Sort-Object -Property AssignedUsers -Descending)
+    Write-Log "Licensing tab: $(@($licensingRows).Count) SKUs"
+}
+
+# ----- SharePoint tab — every site in the bulk usage report, augmented with
+# group context (DisplayName / SMTP / IsTeam) where available. Built from
+# $script:spUsageBySiteUrl (populated in Initialize-SharePointUsageCache).
+$sharePointRows = @()
+if ($collect.SharePoint -and $script:spUsageBySiteUrl -and $script:spUsageBySiteUrl.Count -gt 0) {
+    $siteToGroup = @{}
+    foreach ($row in $m365Rows) {
+        if ($row.SharePointSiteUrl) { $siteToGroup[$row.SharePointSiteUrl] = $row }
+    }
+    $sharePointRows = foreach ($url in $script:spUsageBySiteUrl.Keys) {
+        $u = $script:spUsageBySiteUrl[$url]
+        $g = if ($siteToGroup.ContainsKey($url)) { $siteToGroup[$url] } else { $null }
+        $usedBytes = $null; $usedMB = $null
+        if ($u.'Storage Used (Byte)') {
+            try {
+                $usedBytes = [long]$u.'Storage Used (Byte)'
+                $usedMB    = [math]::Round($usedBytes / 1MB, 2)
+            } catch { }
+        }
+        [pscustomobject]@{
+            SiteUrl              = $url
+            SiteName             = $u.'Site Name'
+            OwnerDisplayName     = $u.'Owner Display Name'
+            OwnerPrincipalName   = $u.'Owner Principal Name'
+            BackingGroupName     = if ($g) { $g.DisplayName }              else { $null }
+            BackingGroupSmtp     = if ($g) { $g.PrimarySmtpAddress }       else { $null }
+            IsTeamProvisioned    = if ($g) { [bool]$g.IsTeamProvisioned }  else { $null }
+            FileCount            = $u.'File Count'
+            ActiveFileCount      = $u.'Active File Count'
+            StorageUsedBytes     = $usedBytes
+            StorageUsedMB        = $usedMB
+            StorageQuotaBytes    = $u.'Storage Allocated (Byte)'
+            LastActivityDate     = $u.'Last Activity Date'
+            RootWebTemplate      = $u.'Root Web Template'
+            ReportRefreshDate    = $u.'Report Refresh Date'
+        }
+    }
+    $sharePointRows = @($sharePointRows | Sort-Object -Property StorageUsedBytes -Descending)
+    Write-Log "SharePoint tab: $(@($sharePointRows).Count) sites"
+}
+
+# ----- Summary counts. Only include sections for blocks the active mode
+# actually collected — avoids confusing "0" lines when a section was skipped.
+$summary = @()
+if ($collect.Mailboxes) {
+    $summary += [pscustomobject]@{ Category = 'Shared Mailboxes';                   Count = @($sharedRows).Count }
+    $summary += [pscustomobject]@{ Category = 'User Mailboxes';                     Count = @($userRows).Count }
+    $summary += [pscustomobject]@{ Category = 'Resource Mailboxes (Room/Equipment)';Count = @($resourceRows).Count }
+}
+if ($collect.DistributionGroups) {
+    $summary += [pscustomobject]@{ Category = 'Distribution Groups';                Count = @($dgRows).Count }
+    $summary += [pscustomobject]@{ Category = 'Mail-Enabled Security Groups';       Count = @($mesgRows).Count }
+}
+if ($collect.M365Groups) {
+    $summary += [pscustomobject]@{ Category = 'M365 Groups (Unified)';              Count = @($m365Rows).Count }
+    $summary += [pscustomobject]@{ Category = '  -> Teams-provisioned';             Count = @($m365Rows | Where-Object { $_.IsTeamProvisioned }).Count }
+}
+if ($collect.Teams) {
+    $summary += [pscustomobject]@{ Category = 'Microsoft Teams';                    Count = @($teamRows).Count }
+}
+if ($collect.SecurityGroups) {
+    $summary += [pscustomobject]@{ Category = 'Cloud Security Groups (non-mail)';   Count = @($secRows).Count }
+}
+if ($collect.SharePoint) {
+    $summary += [pscustomobject]@{ Category = '— SharePoint —';                      Count = $null }
+    $summary += [pscustomobject]@{ Category = 'SharePoint Sites (from usage report)';Count = @($sharePointRows).Count }
+}
+if ($collect.Licensing) {
+    $summary += [pscustomobject]@{ Category = '— Licensing —';                       Count = $null }
+    $summary += [pscustomobject]@{ Category = 'Subscribed SKUs';                     Count = @($licensingRows).Count }
+    $summary += [pscustomobject]@{ Category = 'Users with at least one license';     Count = @($script:LicenseByUpn.Keys | Where-Object { @($script:LicenseByUpn[$_]).Count -gt 0 }).Count }
+}
+if ($collect.ConditionalAccess) {
+    $summary += [pscustomobject]@{ Category = '— CA —';                              Count = $null }
+    $summary += [pscustomobject]@{ Category = 'CA Policies (total)';                 Count = @($caPolicyRows).Count }
+    $summary += [pscustomobject]@{ Category = '  -> enabled';                        Count = @($caPolicyRows | Where-Object { $_.State -eq 'enabled' }).Count }
+    $summary += [pscustomobject]@{ Category = '  -> report-only';                    Count = @($caPolicyRows | Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' }).Count }
+    $summary += [pscustomobject]@{ Category = '  -> disabled';                       Count = @($caPolicyRows | Where-Object { $_.State -eq 'disabled' }).Count }
+    $summary += [pscustomobject]@{ Category = 'CA Named Locations';                  Count = @($caNamedLocationRows).Count }
+    $summary += [pscustomobject]@{ Category = '  -> trusted';                        Count = @($caNamedLocationRows | Where-Object { $_.IsTrusted }).Count }
+    $summary += [pscustomobject]@{ Category = 'CA Authentication-Strength Policies'; Count = @($caAuthStrengthRows).Count }
+    $summary += [pscustomobject]@{ Category = 'Authentication-Methods Policy entries';Count = @($authMethodsPolicyRows).Count }
+    $summary += [pscustomobject]@{ Category = '  -> methods enabled';                Count = @($authMethodsPolicyRows | Where-Object { $_.State -eq 'enabled' }).Count }
+}
+if ($collect.AdminPosture) {
+    $summary += [pscustomobject]@{ Category = '— Admin posture —';                    Count = $null }
+    $summary += [pscustomobject]@{ Category = 'Directory roles with assignments';     Count = @($dirRoleRows).Count }
+    $summary += [pscustomobject]@{ Category = 'Admin assignments — active';           Count = @($adminUserRows | Where-Object { $_.AssignmentSource -eq 'Active' }).Count + @($adminSpRows | Where-Object { $_.AssignmentSource -eq 'Active' }).Count }
+    $summary += [pscustomobject]@{ Category = 'Admin assignments — eligible (PIM)';   Count = @($adminUserRows | Where-Object { $_.AssignmentSource -eq 'Eligible (PIM)' }).Count + @($adminSpRows | Where-Object { $_.AssignmentSource -eq 'Eligible (PIM)' }).Count }
+    $summary += [pscustomobject]@{ Category = 'Distinct human admins';                Count = @($adminUserRows | Where-Object { $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
+    $summary += [pscustomobject]@{ Category = '  -> Global Administrator role holders';Count = @($adminUserRows | Where-Object { $_.RoleName -eq 'Global Administrator' -and $_.UserPrincipalName } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
+    $summary += [pscustomobject]@{ Category = '  -> admins NOT MFA-registered';       Count = @($adminUserRows | Where-Object { $_.UserPrincipalName -and $_.IsMfaRegistered -eq $false } | Select-Object -ExpandProperty UserPrincipalName -Unique).Count }
+    $summary += [pscustomobject]@{ Category = 'Admin role-holding service principals (distinct)'; Count = @($adminSpRows | Select-Object -ExpandProperty AppId -Unique).Count }
+    $summary += [pscustomobject]@{ Category = 'Admin role-holding groups';            Count = @($adminUserRows | Where-Object { $_.UserType -eq 'Group' } | Select-Object -ExpandProperty PrincipalId -Unique).Count }
+    $summary += [pscustomobject]@{ Category = 'Break-glass candidates';               Count = @($breakGlassRows).Count }
+}
 
 $meta = @(
     [pscustomobject]@{ Field = 'Run Timestamp';         Value = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
-    [pscustomobject]@{ Field = 'Tenant ID';             Value = if ($ctx) { $ctx.TenantId } else { '(graph not connected)' } }
+    [pscustomobject]@{ Field = 'Tenant ID';             Value = if ($ctx) { $ctx.TenantId } else { $TenantId } }
     [pscustomobject]@{ Field = 'Run As';                Value = if ($ctx) { $ctx.Account } else { (whoami) } }
     [pscustomobject]@{ Field = 'OutputPath';            Value = $OutputPath }
+    [pscustomobject]@{ Field = 'Mode';                  Value = $Mode }
     [pscustomobject]@{ Field = 'SkipMailboxStats';      Value = [bool]$SkipMailboxStats }
     [pscustomobject]@{ Field = 'SkipPermissions';       Value = [bool]$SkipPermissions }
     [pscustomobject]@{ Field = 'SkipUserMailboxes';     Value = [bool]$SkipUserMailboxes }
@@ -2000,15 +2291,18 @@ $meta = @(
     [pscustomobject]@{ Field = 'SkipAdminPosture';      Value = [bool]$SkipAdminPosture }
     [pscustomobject]@{ Field = 'BreakGlassNamePattern'; Value = $BreakGlassNamePattern }
     [pscustomobject]@{ Field = 'InactiveAdminDays';     Value = $InactiveAdminDays }
-    [pscustomobject]@{ Field = 'GraphConnected';        Value = $graphConnected }
-    [pscustomobject]@{ Field = 'TeamsConnected';        Value = $teamsConnected }
+    [pscustomobject]@{ Field = 'EXOConnected';          Value = [bool]$needExo }
+    [pscustomobject]@{ Field = 'GraphConnected';        Value = [bool]$graphConnected }
+    [pscustomobject]@{ Field = 'TeamsConnected';        Value = [bool]$teamsConnected }
 )
 
 $xl = @{ AutoSize = $true; AutoFilter = $true; FreezeTopRow = $true; BoldTopRow = $true }
 
 # Summary tab — metadata block on top, counts table below it.
 $meta    | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -StartRow 1                                @xl
-$summary | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -StartRow ($meta.Count + 3) -TableName 'Counts' -TableStyle Medium2
+if (@($summary).Count -gt 0) {
+    $summary | Export-Excel -Path $OutputPath -WorksheetName 'Summary' -StartRow ($meta.Count + 3) -TableName 'Counts' -TableStyle Medium2
+}
 
 # Mail / group inventory tabs
 if ($sharedRows)   { $sharedRows   | Export-Excel -Path $OutputPath -WorksheetName 'Shared Mailboxes'        @xl }
@@ -2019,6 +2313,10 @@ if ($mesgRows)     { $mesgRows     | Export-Excel -Path $OutputPath -WorksheetNa
 if ($m365Rows)     { $m365Rows     | Export-Excel -Path $OutputPath -WorksheetName 'M365 Groups'             @xl }
 if ($teamRows)     { $teamRows     | Export-Excel -Path $OutputPath -WorksheetName 'Teams'                   @xl }
 if ($secRows)      { $secRows      | Export-Excel -Path $OutputPath -WorksheetName 'Security Groups (cloud)' @xl }
+
+# SharePoint + Licensing derived tabs
+if ($sharePointRows) { $sharePointRows | Export-Excel -Path $OutputPath -WorksheetName 'SharePoint' @xl }
+if ($licensingRows)  { $licensingRows  | Export-Excel -Path $OutputPath -WorksheetName 'Licensing'  @xl }
 
 # Conditional Access tabs
 if ($caPolicyRows)         { $caPolicyRows         | Export-Excel -Path $OutputPath -WorksheetName 'CA Policies'          @xl }
@@ -2037,6 +2335,8 @@ $script:RunLog     | Export-Excel -Path $OutputPath -WorksheetName 'Run Log'    
 Write-Log "Done. Workbook at: $OutputPath"
 
 # --------------------------------------------------------------------- disconnect
-Try-Block { Disconnect-ExchangeOnline -Confirm:$false } 'Disconnect-ExchangeOnline' | Out-Null
+# Only disconnect what we actually connected — avoids spurious "no session"
+# errors and saves a few hundred ms per tenant in slimmer modes.
+if ($needExo)        { Try-Block { Disconnect-ExchangeOnline -Confirm:$false } 'Disconnect-ExchangeOnline' | Out-Null }
 if ($graphConnected) { Try-Block { Disconnect-MgGraph } 'Disconnect-MgGraph' | Out-Null }
 if ($teamsConnected) { Try-Block { Disconnect-MicrosoftTeams } 'Disconnect-MicrosoftTeams' | Out-Null }

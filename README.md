@@ -5,7 +5,7 @@ A PowerShell 7 toolkit that runs a Microsoft 365 posture inventory across every 
 ## What's in the box
 
 - `Get-O365MailGroupInventory-Multi.ps1` — the wrapper. Authenticates against your partner tenant, enumerates GDAP customers, drives the per-tenant collector per customer, builds the rollup.
-- `Get-O365MailGroupInventory.ps1` — the per-tenant collector. Invoked once per customer by the wrapper as a child process. Connects to the target customer tenant via GDAP-delegated Microsoft Graph + Exchange Online (`-DelegatedOrganization`) + Microsoft Teams and writes a 16-tab `.xlsx` of posture data (mailboxes, groups, Teams, Conditional Access, directory roles, admin users, break-glass candidates). Not designed to be run directly — fails fast if `-TenantId` and `-DelegatedOrganization` aren't supplied.
+- `Get-O365MailGroupInventory.ps1` — the per-tenant collector. Invoked once per customer by the wrapper as a child process. Connects to the target customer tenant via GDAP-delegated Microsoft Graph + Exchange Online (`-DelegatedOrganization`) + Microsoft Teams and writes a multi-tab `.xlsx` of posture data (mailboxes, groups, Teams, SharePoint, Licensing, Conditional Access, directory roles, admin users, break-glass candidates). Mode-aware: `-Mode Full` writes everything; `-Mode Light/Security/Mailbox/Teams/SharePoint/Licensing` writes a focused subset and skips unneeded connections so the run is faster. Not designed to be run directly — fails fast if `-TenantId` and `-DelegatedOrganization` aren't supplied.
 - `scripts/Register-PartnerCenterApp.ps1` — one-time partner-app registration with the right permissions and admin consent applied programmatically.
 - `scripts/Setup-LocalConfig.ps1` — interactive config setup. Run once per operator machine.
 - `scripts/Test-TenantPreflight.ps1` — pre-flight validation. Silently tests every GDAP customer tenant and prints a punchlist of the ones that need admin consent or are blocked by Conditional Access, with the consent URL inline.
@@ -138,6 +138,7 @@ For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-O
 
 | Flag | Effect |
 |---|---|
+| `-Mode <name>` | Collection scope. See [Collection modes](#collection-modes) below. Default `Full`. |
 | `-OnlyTenant <name-or-guid>` | Run a single tenant. Matches case-insensitively against `tenantId`, `shortName`, or `displayName`. Useful for retrying a failed tenant. Mutually exclusive with `-TenantListCsv`. |
 | `-TenantListCsv <path>` | Restrict the run to the subset of customers listed in a CSV. Header row needs at least one of `TenantId`, `ShortName`, `DisplayName`, or `Tenant`; other columns ignored. Plugs in directly with the preflight `-Csv` output: `Import-Csv preflight-results_*.csv \| Where-Object Status -eq 'OK' \| Export-Csv ok.csv -NoTypeInformation`, then `-TenantListCsv ./ok.csv`. Mutually exclusive with `-OnlyTenant`. |
 | `-SkipGdapEnumeration` | Skip the partner-tenant enumeration; use only tenants explicitly listed in your config. Useful for testing or fallback. |
@@ -145,6 +146,35 @@ For unattended runs, pass `-NoConfirm`. The prompt is also auto-skipped when `-O
 | `-NoConfirm` | Skip the per-tenant Y/n/q prompt entirely. Required for unattended runs. |
 | `-ConfirmTimeoutSec <n>` | Per-tenant prompt timeout. Default 5. Set to 0 for no wait (same effect as `-NoConfirm`). |
 | `-OutputRoot <path>` | Override where workbooks land. Default: `./output/`. |
+
+### Collection modes
+
+`-Mode <name>` controls which collection blocks the per-tenant collector runs **and** which connections (Exchange Online / Microsoft Graph / Microsoft Teams) it establishes. Skipping unneeded connections is the headline per-tenant speed-up — `Connect-ExchangeOnline` alone is 5–15 seconds per tenant. Output filenames embed the mode (`O365-MailGroupInventory_<mode>_<timestamp>.xlsx`), so different views don't overwrite each other.
+
+| Mode | Collects | Connections | Notes |
+|---|---|---|---|
+| `Full` (default) | Everything | Graph + EXO + Teams | Same as the original behavior. |
+| `Light` | Everything except Conditional Access + Admin Posture | Graph + EXO + Teams | Drops the directory-object resolution loops admin posture runs — the slowest non-mailbox block on big tenants. |
+| `Security` | CA Policies + Named Locations + Auth Strengths + Auth Methods Policy + Directory Roles + Admin Users + Admin SPs + Break-Glass | **Graph only** | EXO + Teams connects skipped entirely. |
+| `Mailbox` | Shared / User / Resource mailboxes + Distribution Groups + Mail-Enabled Sec Groups + Licensing tab | Graph + EXO | Drops Teams connect, SP usage report, CA, admin posture. Combine with `-SkipMailboxStats -SkipPermissions` for the fastest mailbox-list run on large tenants (drops the per-mailbox EXO calls). |
+| `Teams` | Just Teams | Graph + Teams | EXO entirely skipped. Teams rows have no SMTP / WhenCreated / SharePoint columns since those come from the M365 Groups pass. |
+| `SharePoint` | SharePoint usage report (every site, group-backed or not) + M365 Groups for context | Graph + EXO | EXO is needed for `Get-UnifiedGroup` (group-to-site URL mapping). |
+| `Licensing` | `/subscribedSkus` + per-user license assignments | **Graph only** | Fastest mode — seconds per tenant. No EXO, no Teams. |
+
+The existing `Skip*` flags continue to work as fine-grained overrides within a mode (so `-Mode Mailbox -SkipMailboxStats -SkipPermissions` is the leanest mailbox-list run; `-Mode Light -SkipPermissions` skips perms across the rest of the inventory).
+
+Examples:
+
+```powershell
+# Fastest possible run — license catalog only, Graph alone, no EXO/Teams
+./Get-O365MailGroupInventory-Multi.ps1 -Mode Licensing -NoConfirm
+
+# Security & compliance posture for a customer review
+./Get-O365MailGroupInventory-Multi.ps1 -Mode Security -OnlyTenant 'Acme Corp'
+
+# Light run for monthly inventory (drops CA + admin posture)
+./Get-O365MailGroupInventory-Multi.ps1 -Mode Light
+```
 
 ## Configuration
 
@@ -225,10 +255,10 @@ Per-run output (gitignored):
 ```
 output/
 ├── <tenant-shortname>/
-│   └── O365-MailGroupInventory_<UTC-timestamp>.xlsx
+│   └── O365-MailGroupInventory_<mode>_<UTC-timestamp>.xlsx
 ├── _rollup/
-│   └── Multi-Tenant-Rollup_<UTC-timestamp>.xlsx
-└── run-summary_<UTC-timestamp>.csv
+│   └── Multi-Tenant-Rollup_<mode>_<UTC-timestamp>.xlsx
+└── run-summary_<mode>_<UTC-timestamp>.csv
 ```
 
 ## Contributing

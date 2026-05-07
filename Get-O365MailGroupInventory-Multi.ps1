@@ -55,6 +55,23 @@
 .PARAMETER SkipRollup
     If set, per-tenant workbooks are produced but the roll-up is not built.
 
+.PARAMETER Mode
+    Collection scope. Each mode gates which collection blocks the per-tenant
+    collector runs AND which connections (EXO / Graph / Teams) it
+    establishes — skipping unneeded connections is the headline per-tenant
+    speed-up (Connect-ExchangeOnline alone is 5-15s per tenant).
+
+      Full       — everything (default; current behavior)
+      Light      — everything except Conditional Access + Admin Posture
+      Security   — only CA + Admin Posture (Graph only; no EXO, no Teams)
+      Mailbox    — Shared/User/Resource + DGs + MESGs + Licensing column
+      Teams      — only Teams (Graph + Teams; no EXO)
+      SharePoint — SP usage report + M365 Groups for context
+      Licensing  — Subscribed SKUs + per-user licenses (Graph only)
+
+    Output filenames embed the mode so different views don't overwrite each
+    other: O365-MailGroupInventory_<mode>_YYYYMMDD_HHmmss.xlsx.
+
 .PARAMETER NoConfirm
     Skip the per-tenant Y/n/q confirmation prompt. Default is to prompt
     before each tenant with a 5-second auto-Y countdown so the operator
@@ -92,6 +109,21 @@ param(
 
     [switch] $SkipGdapEnumeration,
     [switch] $SkipRollup,
+
+    # Collection scope. Each mode gates which collection blocks the per-tenant
+    # collector runs AND which connections (EXO / Graph / Teams) it
+    # establishes. Skipping unneeded connections is the headline per-tenant
+    # speed-up — Connect-ExchangeOnline alone is 5-15s per tenant.
+    #
+    #   Full       — everything (default; current behavior)
+    #   Light      — everything except Conditional Access + Admin Posture
+    #   Security   — only CA + Admin Posture (Graph only; no EXO, no Teams)
+    #   Mailbox    — Shared/User/Resource + DGs + MESGs + Licensing column
+    #   Teams      — only Teams (Graph + Teams; no EXO)
+    #   SharePoint — SP usage report + M365 Groups for context
+    #   Licensing  — Subscribed SKUs + per-user licenses (Graph only)
+    [ValidateSet('Full','Light','Security','Mailbox','Teams','SharePoint','Licensing')]
+    [string] $Mode = 'Full',
     # Auth mode. Default = delegated: the running user signs in interactively
     # and relies on GDAP/Lighthouse for customer-tenant authorization. Set
     # -AppOnly for unattended/scheduled runs that authenticate via the
@@ -182,6 +214,7 @@ function Read-TenantConfirmation {
 # Module / library bootstrap
 # ============================================================================
 
+Write-MultiLog ("Run mode: {0}" -f $Mode)
 Write-MultiLog 'Bootstrapping modules...'
 
 # The collector (the bundled per-tenant inventory script this wrapper drives) handles
@@ -299,11 +332,33 @@ if ($AppOnly) {
 } else {
     # Delegated: user signs in interactively under the partner-app clientId.
     # First run prompts (browser/device-code); subsequent runs in the same
-    # session reuse cached refresh tokens.
-    Connect-MgGraph -TenantId $config.partner.homeTenantId `
-                    -ClientId $config.partner.clientId `
-                    -Scopes   'DelegatedAdminRelationship.Read.All','Directory.Read.All' `
-                    -NoWelcome
+    # session reuse cached refresh tokens. Wrap in a fallback that catches
+    # browser-launch / platform-not-supported failures (e.g. macOS versions
+    # MSAL doesn't recognize) and retries with -UseDeviceCode so the operator
+    # can sign in from any browser on any device.
+    $homeId = $config.partner.homeTenantId
+    $clientId = $config.partner.clientId
+    try {
+        Connect-MgGraph -TenantId $homeId -ClientId $clientId `
+                        -Scopes   'DelegatedAdminRelationship.Read.All','Directory.Read.All' `
+                        -NoWelcome
+    } catch {
+        $isInteractiveFailure = $false
+        $cur = $_.Exception
+        while ($cur) {
+            if ($cur -is [System.PlatformNotSupportedException]) { $isInteractiveFailure = $true; break }
+            $cur = $cur.InnerException
+        }
+        $msg = $_.Exception.Message
+        if (-not $isInteractiveFailure -and (
+                $msg -match 'PlatformNotSupportedException|StartDefaultOsBrowserAsync|Unable to start the browser|No web browser|macOS \d+\.\d+'
+        )) { $isInteractiveFailure = $true }
+        if (-not $isInteractiveFailure) { throw }
+        Write-MultiLog ("Microsoft Graph interactive sign-in failed ({0}). Retrying with device-code auth — open the printed verification URL on any device, paste the code, and sign in." -f $msg) 'WARN'
+        Connect-MgGraph -TenantId $homeId -ClientId $clientId `
+                        -Scopes   'DelegatedAdminRelationship.Read.All','Directory.Read.All' `
+                        -NoWelcome -UseDeviceCode
+    }
 }
 
 $ctx = Get-MgContext
@@ -586,7 +641,7 @@ foreach ($tenant in $tenantTargets) {
 
     $tenantOutDir = Join-Path $OutputRoot $tenant.ShortName
     if (-not (Test-Path $tenantOutDir)) { New-Item -ItemType Directory -Path $tenantOutDir -Force | Out-Null }
-    $tenantXlsx   = Join-Path $tenantOutDir ("O365-MailGroupInventory_{0}.xlsx" -f $script:RunStamp)
+    $tenantXlsx   = Join-Path $tenantOutDir ("O365-MailGroupInventory_{0}_{1}.xlsx" -f $Mode.ToLower(), $script:RunStamp)
 
     $tenantStatus = 'pending'
     $tenantWarnings = @()
@@ -624,7 +679,8 @@ foreach ($tenant in $tenantTargets) {
             '-OutputPath', $tenantXlsx,
             '-TenantId',   $tenant.TenantId,
             '-ClientId',   $config.partner.clientId,
-            '-DelegatedOrganization', $tenant.PrimaryDomain
+            '-DelegatedOrganization', $tenant.PrimaryDomain,
+            '-Mode',       $Mode
         )
 
         # Pass through skip flags from the config defaults block.
@@ -686,7 +742,7 @@ foreach ($tenant in $tenantTargets) {
 if (-not $SkipRollup) {
     $rollupDir  = Join-Path $OutputRoot '_rollup'
     if (-not (Test-Path $rollupDir)) { New-Item -ItemType Directory -Path $rollupDir -Force | Out-Null }
-    $rollupXlsx = Join-Path $rollupDir ("Multi-Tenant-Rollup_{0}.xlsx" -f $script:RunStamp)
+    $rollupXlsx = Join-Path $rollupDir ("Multi-Tenant-Rollup_{0}_{1}.xlsx" -f $Mode.ToLower(), $script:RunStamp)
 
     Write-MultiLog "Building roll-up workbook at $rollupXlsx..."
 
@@ -760,7 +816,7 @@ Write-MultiLog ("Done. Tenants in summary: {0}; ok: {1}; error: {2}; skipped: {3
     @($script:RunResults).Count, $ok, $err, $skipped, $elapsed, $quitNote)
 
 # Per-run summary CSV alongside the rollup, useful for diffing runs.
-$summaryCsv = Join-Path $OutputRoot ("run-summary_{0}.csv" -f $script:RunStamp)
+$summaryCsv = Join-Path $OutputRoot ("run-summary_{0}_{1}.csv" -f $Mode.ToLower(), $script:RunStamp)
 $script:RunResults | Export-Csv -NoTypeInformation -Path $summaryCsv
 Write-MultiLog "Per-run summary at $summaryCsv"
 
